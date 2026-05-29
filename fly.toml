@@ -1,0 +1,41 @@
+# ─── Desacratio VPN — Fly.io Deployment ──────────────────────────────────
+# Relay Proxy (HTTP CONNECT) — работает БЕЗ Cloudflare.
+# ──────────────────────────────────────────────────────────────────────────
+# Деплой:
+#   flyctl launch --copy-config --no-deploy
+#   flyctl secrets set RELAY_DOMAIN=vpn.example.com
+#   flyctl deploy
+# ──────────────────────────────────────────────────────────────────────────
+# Проверка:
+#   curl -x http://vpn.fly.dev:443 https://api.ipify.org
+#   → должен вернуть ваш внешний IP
+# ──────────────────────────────────────────────────────────────────────────
+
+app = "desacratio-relay"
+
+[build]
+  dockerfile = "Dockerfile.relay"
+
+[env]
+  PORT = "8443"
+  RELAY_HOST = "0.0.0.0"
+
+[[services]]
+  internal_port = 8443
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls"]  # Fly.io предоставляет TLS (Let's Encrypt)
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
+  [[services.ports]]
+    port = 8080       # Дополнительный порт без TLS
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 100
+    soft_limit = 50

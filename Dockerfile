@@ -1,6 +1,6 @@
 # ─── Desacratio VPN — Main Dockerfile ───────────────────────────────────
 # Деплой:   Render.com (Web Service)
-# Содержит API (warp-api.py + proxy_scraper.py) + Telegram бота (free-bot.py).
+# Содержит WARP API + Relay Proxy + Telegram бота.
 # Запускаются через start.sh.
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -16,12 +16,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ─── Shared DB ──────────────────────────────────────────────────────────
 COPY db.py ./
 
-# ─── API + Relay Proxy ─────────────────────────────────────────────────
+# ─── WARP API ───────────────────────────────────────────────────────────
 COPY api/requirements.txt ./requirements-api.txt
 COPY api/warp-api.py ./
+COPY api/warp_reg.py ./api/
 COPY api/warp_api_wrapper.py ./api/
+
+# ─── Relay Proxy (опционально, для HTTP CONNECT) ────────────────────────
 COPY api/relay_proxy.py ./api/
-COPY api/proxy_scraper.py ./api/
 
 # ─── Bot ────────────────────────────────────────────────────────────────
 COPY bot/requirements.txt ./requirements-bot.txt
@@ -41,5 +43,5 @@ RUN mkdir -p /app/data/cache
 # Порт (Render задаёт PORT, но EXPOSE для документации)
 EXPOSE 8443
 
-# Запуск: API (фон) + Bot (передний план)
+# Запуск: API (фон) + Bot (передний план) — start.sh решает какой режим
 CMD ["bash", "start.sh"]

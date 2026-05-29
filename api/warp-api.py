@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Desacratio VPN — Config Generation API
-========================================
-Генерирует WireGuard конфиги через собственные серверы.
+Desacratio VPN — Config Generation API (WARP + Relay)
+=======================================================
+Генерирует WireGuard (WARP) конфиги через Cloudflare WARP.
 5 стран, уникальные ключи для каждого пользователя.
 
 Подписка совместима с: Hiddify, v2rayTun, Sing-box, Clash, Happ, Streisand, Nekoray
@@ -25,8 +25,9 @@ import sys
 import json
 import time
 import random
+import hashlib
 import logging
-import subprocess
+import urllib.request
 from functools import wraps
 
 # ─── DB ───────────────────────────────────────────────────────────────────
@@ -34,7 +35,6 @@ try:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
     from db import has_active_sub, get_sub_info, ensure_user, init_db
 except ImportError:
-    # fallback
     def has_active_sub(*a): return True
     def get_sub_info(*a): return {"status": "ok"}
     def ensure_user(*a): pass
@@ -44,6 +44,7 @@ except ImportError:
 try:
     from flask import Flask, jsonify, request, Response
 except ImportError:
+    import subprocess
     subprocess.check_call(
         [sys.executable, "-m", "pip", "install", "flask", "--break-system-packages"]
     )
@@ -53,9 +54,7 @@ except ImportError:
 HOST          = os.environ.get("API_HOST", "0.0.0.0")
 PORT          = int(os.environ.get("PORT", os.environ.get("API_PORT", "8443")))
 
-# Render.com URL для self-reference
 RENDER_URL    = os.environ.get("RENDER_URL", os.environ.get("RENDER_EXTERNAL_URL", "")).rstrip("/")
-WARP_REG_BIN  = os.environ.get("WARP_REG_BIN", os.path.join(os.path.dirname(__file__), "warp-reg"))  # не используется
 RATE_LIMIT    = int(os.environ.get("RATE_LIMIT", "20"))
 CACHE_TTL     = int(os.environ.get("CACHE_TTL", "86400"))
 SERVERS_CNT   = int(os.environ.get("SERVERS_COUNT", "5"))
@@ -77,11 +76,16 @@ logging.basicConfig(
 logger = logging.getLogger("desacratio-api")
 
 app = Flask(__name__)
-
-# Rate limit storage
 request_log: dict = {}
 
-# ─── Сервера (5 стран, разные endpoint'ы) ────────────────────────────────
+# ─── WARP Config Generator ───────────────────────────────────────────────
+
+try:
+    from api.warp_reg import register_warp, make_wireguard_config
+except ImportError:
+    from warp_reg import register_warp, make_wireguard_config
+
+# ─── Сервера (5 стран, разные WARP endpoint'ы) ────────────────────────────
 SERVERS = [
     {"id": "pl", "name": "Poland",     "flag": "🇵🇱", "emoji": "🌍",
      "endpoint": "162.159.193.3:2408",  "color": "#3B82F6"},
@@ -95,106 +99,129 @@ SERVERS = [
      "endpoint": "engage.cloudflareclient.com:2408", "color": "#8B5CF6"},
 ]
 
-# ─── Relay Proxy (встроенный HTTP CONNECT) ──────────────────────────────
-RELAY_DOMAIN = os.environ.get(
-    "RELAY_DOMAIN",
-    (RENDER_URL or "desacratio-vpn.onrender.com").replace("https://", "").rstrip("/"),
-)
 
-RELAY_COUNTRIES = [
-    {"id": "pl", "name": "Poland",     "flag": "🇵🇱"},
-    {"id": "de", "name": "Germany",    "flag": "🇩🇪"},
-    {"id": "nl", "name": "Netherlands","flag": "🇳🇱"},
-    {"id": "gb", "name": "UK",         "flag": "🇬🇧"},
-    {"id": "us", "name": "USA",        "flag": "🇺🇸"},
-]
+# ─── Кеш WARP конфигов ────────────────────────────────────────────────────
+# Храним сгенерированные конфиги в памяти (переживают рестарт воркера).
+# Ключ: user_id, значение: {config, generated_at}
+
+_warp_cache: dict = {}
+_WARP_TTL = 21600  # 6 часов (WARP сессия живёт ~24ч, обновляем с запасом)
+
+
+def _get_warp_config(user_id: str) -> dict:
+    """
+    Возвращает WARP конфиг для пользователя (из кеша или новый).
+    Один конфиг на пользователя — сервера отличаются только endpoint'ом.
+    """
+    now = time.time()
+    cached = _warp_cache.get(user_id)
+
+    if cached and (now - cached["generated_at"]) < _WARP_TTL:
+        logger.debug(f"WARP cache HIT for {user_id}")
+        return cached["config"]
+
+    logger.info(f"🆕 Регистрация WARP для {user_id}...")
+    config = register_warp()
+    _warp_cache[user_id] = {
+        "config": config,
+        "generated_at": now,
+    }
+    logger.info(f"  ✅ WARP registered: device={config['device_id'][:8]}...")
+    return config
 
 
 def get_proxy_configs(user_id: str) -> list:
     """
-    Возвращает 5 релей-прокси (HTTP CONNECT через наш сервер).
+    Возвращает WARP-WireGuard конфиги для пользователя.
+    Каждый сервер — тот же WARP ключ, но с разным WARP endpoint'ом.
     """
+    warp = _get_warp_config(user_id)
+
     configs = []
-    for i, country in enumerate(RELAY_COUNTRIES):
+    for srv in SERVERS:
         configs.append({
-            "flag": country["flag"],
-            "name": country["name"],
-            "type": "http",
-            "server": RELAY_DOMAIN,
-            "port": 443,
-            "tls": True,
-            "country": country["id"].upper(),
+            "flag":       srv["flag"],
+            "name":       srv["name"],
+            "type":       "wireguard",
+            "country":    srv["id"].upper(),
+            "server":     srv["endpoint"].rsplit(":", 1)[0],
+            "port":       int(srv["endpoint"].rsplit(":", 1)[1]),
+            "local_address": [
+                f"{warp['v4']}/32",
+                f"{warp['v6']}/128",
+            ],
+            "private_key":      warp["private_key"],
+            "peer_public_key":  warp["peer_public_key"],
+            "reserved":         warp["reserved"],
+            "mtu": 1280,
         })
-    logger.info(f"🔌 Relay proxy configs для {user_id}: {len(configs)} шт (domain={RELAY_DOMAIN})")
+
     return configs
 
 
-# ─── Форматтеры подписок (прокси) ──────────────────────────────────────────
+# ─── Форматтеры подписок (WARP / WireGuard) ────────────────────────────────
 
 def format_singbox(proxy_configs: list, user_id: str) -> dict:
-    """
-    Формат Sing-box JSON с HTTP/SOCKS5 outbound'ами.
-    """
+    """Формат Sing-box JSON с WireGuard outbound'ами."""
     outbounds = []
-    for i, cfg in enumerate(proxy_configs):
-        tag = f"{cfg['flag']} {cfg['name']}"
-        outbound_type = "http" if cfg["type"] in ("http", "https") else "socks"
-
-        outbound = {
-            "type": outbound_type,
-            "tag": tag,
+    for cfg in proxy_configs:
+        outbounds.append({
+            "type": "wireguard",
+            "tag": f"{cfg['flag']} {cfg['name']}",
             "server": cfg["server"],
-            "server_port": int(cfg["port"]),
-        }
+            "server_port": cfg["port"],
+            "local_address": cfg["local_address"],
+            "private_key": cfg["private_key"],
+            "peer_public_key": cfg["peer_public_key"],
+            "reserved": cfg["reserved"],
+            "mtu": cfg.get("mtu", 1280),
+        })
 
-        # TLS для HTTP CONNECT через HTTPS
-        if cfg.get("tls") and outbound_type == "http":
-            outbound["tls"] = {}
-
-        outbounds.append(outbound)
-
-    return {
-        "outbounds": outbounds,
-    }
+    return {"outbounds": outbounds}
 
 
 def format_clash(proxy_configs: list, user_id: str) -> str:
-    """
-    Формат Clash Meta YAML с HTTP/SOCKS5 прокси.
-    """
-    lines = []
-    lines.append("port: 7890")
-    lines.append("socks-port: 7891")
-    lines.append("allow-lan: false")
-    lines.append("mode: Rule")
-    lines.append("log-level: warning")
-    lines.append("")
-    lines.append("proxies:")
+    """Формат Clash Meta YAML с WireGuard прокси."""
+    lines = [
+        "port: 7890",
+        "socks-port: 7891",
+        "allow-lan: false",
+        "mode: Rule",
+        "log-level: warning",
+        "",
+        "proxies:",
+    ]
     proxy_names = []
     for cfg in proxy_configs:
         name = f"{cfg['flag']} {cfg['name']}"
         proxy_names.append(name)
-        proxy_type = "http" if cfg["type"] in ("http", "https") else "socks5"
-        lines.append(f"  - name: \"{name}\"")
-        lines.append(f"    type: {proxy_type}")
+        lines.append(f'  - name: "{name}"')
+        lines.append("    type: wireguard")
         lines.append(f"    server: {cfg['server']}")
         lines.append(f"    port: {cfg['port']}")
-        if cfg.get("tls") and proxy_type == "http":
-            lines.append("    tls: true")
+        lines.append(f"    ip: {cfg['local_address'][0].split('/')[0]}")
+        lines.append(f"    ipv6: {cfg['local_address'][1].split('/')[0]}")
+        lines.append(f"    private-key: {cfg['private_key']}")
+        lines.append(f"    public-key: {cfg['peer_public_key']}")
+        reserved_str = ", ".join(str(r) for r in cfg["reserved"])
+        lines.append(f"    reserved: [{reserved_str}]")
+        lines.append("    udp: true")
+        lines.append("    mtu: 1280")
         lines.append("")
+
     lines.append("proxy-groups:")
     lines.append("  - name: Proxy")
     lines.append("    type: select")
     lines.append("    proxies:")
-    lines.append("      - \"🔀 Авто\"")
+    lines.append('      - "🔀 Авто"')
     for n in proxy_names:
-        lines.append(f"      - \"{n}\"")
+        lines.append(f'      - "{n}"')
     lines.append("")
-    lines.append("  - name: \"🔀 Авто\"")
+    lines.append('  - name: "🔀 Авто"')
     lines.append("    type: url-test")
     lines.append("    proxies:")
     for n in proxy_names:
-        lines.append(f"      - \"{n}\"")
+        lines.append(f'      - "{n}"')
     lines.append("    url: http://www.gstatic.com/generate_204")
     lines.append("    interval: 300")
     lines.append("")
@@ -205,15 +232,41 @@ def format_clash(proxy_configs: list, user_id: str) -> str:
 
 
 def format_wg_conf_all(proxy_configs: list, user_id: str) -> str:
-    """
-    Справка: WireGuard .conf больше не генерируется (WARP недоступен).
-    """
-    return (
-        f"# {BRAND}\n"
-        f"# ВНИМАНИЕ: WireGuard/WARP больше не используется.\n"
-        f"# Используй Sing-box или Clash подписку для Happ.\n"
-        f"# User ID: {user_id}\n"
-    )
+    """Генерирует WireGuard .conf со всеми 5 серверами."""
+    parts = [
+        f"# ============================================",
+        f"# {BRAND} — WireGuard Config",
+        f"# User: {user_id}",
+        f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"# Servers: {len(proxy_configs)}",
+        f"# ============================================",
+        f"#",
+        f"# Channel: {CHANNEL}",
+        f"#",
+    ]
+
+    # Берём первый конфиг для Interface (все используют один ключ)
+    first = proxy_configs[0]
+    parts.append("[Interface]")
+    parts.append(f"PrivateKey = {first['private_key']}")
+    parts.append(f"Address = {first['local_address'][0]}")
+    parts.append(f"Address = {first['local_address'][1]}")
+    parts.append("DNS = 1.1.1.1, 1.0.0.1")
+    parts.append("MTU = 1280")
+    parts.append("")
+    parts.append("# ─── Peer'ы (выбери один, раскомментировав) ────")
+
+    for i, cfg in enumerate(proxy_configs):
+        parts.append(f"# ========== {cfg['flag']} {cfg['name']} ==========")
+        parts.append(f"# [Peer]")
+        parts.append(f"# PublicKey = {cfg['peer_public_key']}")
+        parts.append(f"# AllowedIPs = 0.0.0.0/0")
+        parts.append(f"# AllowedIPs = ::/0")
+        parts.append(f"# Endpoint = {cfg['server']}:{cfg['port']}")
+        parts.append(f"# PersistentKeepalive = 25")
+        parts.append("")
+
+    return "\n".join(parts)
 
 
 # ─── Subscription Check ──────────────────────────────────────────────────
@@ -272,12 +325,12 @@ def index():
     return jsonify({
         "name":        BRAND,
         "logo":        BRAND_LOGO,
-        "version":     "2.0",
+        "version":     "3.0",
         "author":      AUTHOR,
         "channel":     CHANNEL,
         "support":     SUPPORT,
         "purchase":    PURCHASE,
-        "description": "Премиум VPN с собственными серверами в 5 странах.",
+        "description": "Премиум VPN на базе Cloudflare WARP (WireGuard).",
         "endpoints": {
             "health":               "/health",
             "subscription":         "/api/sub/<USER_ID> (Sing-box)",
@@ -288,6 +341,7 @@ def index():
             "sub_status":           "/api/sub/<USER_ID>/status",
         },
         "servers": len(SERVERS),
+        "protocol": "WireGuard (WARP)",
         "sponsor": f"Подпишись: {CHANNEL}",
     })
 
@@ -333,7 +387,7 @@ def get_sub_status(user_id: str):
 @rate_limit
 @require_subscription
 def get_subscription(user_id: str):
-    """Sing-box подписка (прокси, JSON)."""
+    """Sing-box подписка (WireGuard WARP, JSON)."""
     try:
         configs = get_proxy_configs(user_id)
         sub = format_singbox(configs, user_id)
@@ -349,7 +403,7 @@ def get_subscription(user_id: str):
         resp.headers["Content-Disposition"] = "attachment; filename=\"desacratio-singbox.json\""
         resp.headers["Access-Control-Allow-Origin"] = "*"
 
-        logger.info(f"📤 Sing-box subscription for {user_id}: {len(configs)} proxies")
+        logger.info(f"📤 Sing-box WARP для {user_id}: {len(configs)} серверов")
         return resp
     except Exception as e:
         logger.error(f"Subscription error for {user_id}: {e}")
@@ -360,7 +414,7 @@ def get_subscription(user_id: str):
 @rate_limit
 @require_subscription
 def get_clash_subscription(user_id: str):
-    """Clash-подписка YAML для Happ/v2rayTun."""
+    """Clash-подписка YAML с WireGuard WARP."""
     try:
         configs = get_proxy_configs(user_id)
         yaml_str = format_clash(configs, user_id)
@@ -376,7 +430,7 @@ def get_clash_subscription(user_id: str):
         resp.headers["Content-Disposition"] = "attachment; filename=\"desacratio-clash.yaml\""
         resp.headers["Access-Control-Allow-Origin"] = "*"
 
-        logger.info(f"📤 Clash YAML subscription for {user_id}: {len(configs)} proxies")
+        logger.info(f"📤 Clash WARP для {user_id}: {len(configs)} серверов")
         return resp
     except Exception as e:
         logger.error(f"Clash error for {user_id}: {e}")
@@ -387,7 +441,7 @@ def get_clash_subscription(user_id: str):
 @rate_limit
 @require_subscription
 def get_wg_conf(user_id: str):
-    """Информация: WireGuard .conf больше не поддерживается."""
+    """WireGuard .conf со всеми 5 серверами."""
     try:
         configs = get_proxy_configs(user_id)
         conf = format_wg_conf_all(configs, user_id)
@@ -409,7 +463,7 @@ def get_wg_conf(user_id: str):
 @rate_limit
 @require_subscription
 def get_servers_list(user_id: str):
-    """Возвращает список прокси пользователя."""
+    """Возвращает список WARP серверов пользователя."""
     try:
         configs = get_proxy_configs(user_id)
         servers = []
@@ -418,7 +472,7 @@ def get_servers_list(user_id: str):
                 "id":       cfg.get("country", f"srv{i}"),
                 "name":     cfg["name"],
                 "flag":     cfg["flag"],
-                "type":     cfg["type"],
+                "type":     "wireguard",
                 "endpoint": f"{cfg['server']}:{cfg['port']}",
             })
         return jsonify({
@@ -434,12 +488,15 @@ def get_servers_list(user_id: str):
 @rate_limit
 @require_subscription
 def refresh_subscription(user_id: str):
-    """Принудительно обновить список релей-прокси."""
+    """Принудительно перерегистрировать WARP (новый ключ)."""
     try:
+        # Сбрасываем кеш — при следующем запросе будет новая регистрация
+        if user_id in _warp_cache:
+            del _warp_cache[user_id]
         configs = get_proxy_configs(user_id)
         return jsonify({
             "success": True,
-            "message": f"🆕 {len(configs)} релей-прокси готовы",
+            "message": f"🆕 WARP перерегистрирован: {len(configs)} серверов",
             "servers": len(configs),
         })
     except Exception as e:
@@ -450,19 +507,17 @@ def refresh_subscription(user_id: str):
 app_start_time = time.time()
 
 if __name__ == "__main__":
-    # Инициализируем БД
     init_db()
 
     logger.info(f"╔══════════════════════════════════════════╗")
-    logger.info(f"║  {BRAND} API Server v3.0")
+    logger.info(f"║  {BRAND} API Server v3.0 (WARP)")
     logger.info(f"║  Author: {AUTHOR}")
     logger.info(f"║  Channel: {CHANNEL}")
     logger.info(f"║  Support: {SUPPORT}")
     logger.info(f"╚══════════════════════════════════════════╝")
     logger.info(f"  Host: {HOST}:{PORT}")
     logger.info(f"  Render URL: {RENDER_URL or '(не задан)'}")
-    logger.info(f"  Релей-прокси: {SERVERS_CNT} шт (HTTP CONNECT)")
-    logger.info(f"  Relay domain: {RELAY_DOMAIN}")
+    logger.info(f"  WARP серверов: {SERVERS_CNT}")
     logger.info(f"  Rate limit: {RATE_LIMIT} req/min")
     logger.info(f"  Data dir: {DATA_DIR}")
 

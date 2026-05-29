@@ -1,0 +1,38 @@
+# ─── Desacratio VPN — Relay Proxy (standalone) ───────────────────────────
+# Отдельный контейнер для HTTP CONNECT релей-прокси.
+# Деплой на любой платформе: Fly.io, Railway, VPS, Render (как второй сервис).
+# ──────────────────────────────────────────────────────────────────────────
+# Использование:
+#   docker build -t desacratio-relay -f Dockerfile.relay .
+#   docker run -p 443:8443 -e RELAY_DOMAIN=vpn.example.com desacratio-relay
+# ──────────────────────────────────────────────────────────────────────────
+# Render: этот файл НЕ используется автоматически (Dockerfile для Web Service)
+# ──────────────────────────────────────────────────────────────────────────
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Системные зависимости
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Только relay proxy (без API, без бота)
+COPY api/relay_proxy.py ./
+COPY api/warp_api_wrapper.py ./
+COPY api/warp-api.py ./
+COPY db.py ./
+
+# requirements
+COPY api/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Директория для кеша
+RUN mkdir -p /app/data/cache
+
+EXPOSE 8443
+
+ENV PORT=8443
+
+CMD ["python3", "relay_proxy.py"]
