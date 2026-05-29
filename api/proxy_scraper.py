@@ -135,11 +135,18 @@ def parse_plain(content: str, default_type: str = "http") -> list:
             parts = line.rsplit(":", 1)
             host, port = parts[0], parts[1]
             if port.isdigit():
+                port_num = int(port)
+                # Авто-определение типа по порту
+                detected_type = default_type
+                if port_num in (1080, 1081, 1082, 9050, 9150, 10800):
+                    detected_type = "socks5"
+                elif port_num in (80, 443, 8080, 3128, 8888, 8889, 9090):
+                    detected_type = "http"
                 proxies.append({
                     "host": host,
-                    "port": int(port),
-                    "type": default_type,
-                    "country": None,  # будет определено позже
+                    "port": port_num,
+                    "type": detected_type,
+                    "country": None,
                 })
     return proxies
 
@@ -156,13 +163,36 @@ def resolve_country(ip: str) -> str | None:
 
 
 def validate_proxy(host: str, port: int, timeout: int = 3) -> bool:
-    """Проверяет, открыт ли порт (TCP handshake)."""
+    """Проверяет, работает ли прокси (HTTP CONNECT или SOCKS5)."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         result = s.connect_ex((host, port))
-        s.close()
-        return result == 0
+        if result != 0:
+            s.close()
+            return False
+
+        # Пробуем SOCKS5 handshake
+        try:
+            s.send(b'\x05\x01\x00')
+            resp = s.recv(2)
+            if resp == b'\x05\x00':
+                s.close()
+                return True  # SOCKS5 работает
+        except:
+            pass
+
+        # Пробуем HTTP CONNECT
+        try:
+            s.send(b'CONNECT httpbin.org:80 HTTP/1.1\r\nHost: httpbin.org\r\n\r\n')
+            resp = s.recv(4096)
+            s.close()
+            if b'200' in resp or b'OK' in resp:
+                return True  # HTTP CONNECT работает
+            return False  # HTTP есть но CONNECT не поддерживает
+        except:
+            s.close()
+            return False
     except Exception:
         return False
 
@@ -248,7 +278,7 @@ def assign_countries(proxies: list, max_lookups: int = 45) -> list:
 
 
 def validate_batch(proxies: list, max_per_country: int = 15) -> list:
-    """Проверяет живые прокси (TCP connect) — не более N на страну."""
+    """Проверяет живые прокси — по N на страну. Обновляет тип по результатам проверки."""
     valid = []
     by_country: dict = {}
     for p in proxies:
@@ -265,9 +295,25 @@ def validate_batch(proxies: list, max_per_country: int = 15) -> list:
             tested += 1
             if ok:
                 alive += 1
+                # Определяем реальный тип по результатам валидации
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(2)
+                    s.connect((p["host"], p["port"]))
+                    s.send(b'\x05\x01\x00')
+                    resp = s.recv(2)
+                    s.close()
+                    if resp == b'\x05\x00':
+                        p["type"] = "socks5"
+                    else:
+                        p["type"] = "http"
+                except:
+                    p["type"] = p.get("type", "http")
                 valid.append(p)
         logger.info(f"  {cc}: {tested} проверено, {alive} живых")
 
+    # Сортируем: SOCKS5 вперёд, HTTP назад
+    valid.sort(key=lambda x: (0 if x["type"] == "socks5" else 1, random.random()))
     return valid
 
 
@@ -340,6 +386,7 @@ def get_proxies(count: int = 5) -> list:
     """
     Возвращает список прокси для пользователя.
     По одному прокси из каждой целевой страны, всего `count` штук.
+    Приоритет: SOCKS5 > HTTP.
     """
     global _cache
     proxies = refresh_cache()
@@ -348,19 +395,24 @@ def get_proxies(count: int = 5) -> list:
         logger.warning("Нет прокси в кеше!")
         return []
 
-    # Группируем по странам
+    # Группируем по странам, SOCKS5 в приоритете
     by_country: dict = {}
     for p in proxies:
         cc = p.get("country", "")
-        by_country.setdefault(cc, []).append(p)
+        by_country.setdefault(cc, {"socks5": [], "http": []})
+        if p["type"] == "socks5":
+            by_country[cc]["socks5"].append(p)
+        else:
+            by_country[cc]["http"].append(p)
 
     result = []
-    # Сначала берём по одному из каждой целевой страны
+    # Сначала берём SOCKS5 из каждой целевой страны
     for cc in TARGET_COUNTRIES:
-        pool = by_country.get(cc, [])
-        random.shuffle(pool)
-        if pool:
-            p = pool[0]
+        pool = by_country.get(cc, {"socks5": [], "http": []})
+        socks = pool.get("socks5", [])
+        random.shuffle(socks)
+        if socks:
+            p = socks[0]
             result.append({
                 "flag": COUNTRY_FLAGS.get(cc, "🌍"),
                 "name": COUNTRY_NAMES.get(cc, cc),
@@ -369,23 +421,38 @@ def get_proxies(count: int = 5) -> list:
                 "port": int(p["port"]),
                 "country": cc,
             })
+        else:
+            http_pool = pool.get("http", [])
+            random.shuffle(http_pool)
+            if http_pool:
+                p = http_pool[0]
+                result.append({
+                    "flag": COUNTRY_FLAGS.get(cc, "🌍"),
+                    "name": COUNTRY_NAMES.get(cc, cc),
+                    "type": p["type"],
+                    "server": p["host"],
+                    "port": int(p["port"]),
+                    "country": cc,
+                })
 
-    # Если не хватает — добираем из любых стран
+    # Если не хватает — добираем из любых стран (SOCKS5 в приоритете)
     if len(result) < count:
-        extras = [p for p in proxies if p.get("country")]
-        random.shuffle(extras)
+        extras = [p for p in proxies if p.get("country") in TARGET_COUNTRIES]
+        extras.sort(key=lambda x: (0 if x["type"] == "socks5" else 1, random.random()))
         for p in extras:
             if len(result) >= count:
                 break
             cc = p.get("country", "XX")
-            result.append({
-                "flag": COUNTRY_FLAGS.get(cc, "🌍"),
-                "name": COUNTRY_NAMES.get(cc, cc),
-                "type": p["type"],
-                "server": p["host"],
-                "port": int(p["port"]),
-                "country": cc,
-            })
+            # Не дублируем уже выбранные IP
+            if not any(r["server"] == p["host"] for r in result):
+                result.append({
+                    "flag": COUNTRY_FLAGS.get(cc, "🌍"),
+                    "name": COUNTRY_NAMES.get(cc, cc),
+                    "type": p["type"],
+                    "server": p["host"],
+                    "port": int(p["port"]),
+                    "country": cc,
+                })
 
     return result[:count]
 
