@@ -561,10 +561,9 @@ def cryptobot_webhook():
         logger.error(f"⚠️ CryptoBot webhook: invalid JSON: {e}")
         return jsonify({"error": "invalid json"}), 400
 
-    # Проверяем что это обновление инвойса
+    # Проверяем что это уведомление об оплате
     update_type = data.get("update_type", "")
-    if update_type not in ("invoice_paid", "invoice_activated"):
-        # Нас интересуют только оплаченные счета
+    if update_type != "invoice_paid":
         return jsonify({"ok": True})
 
     payload_data = data.get("payload", {})

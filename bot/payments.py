@@ -205,13 +205,18 @@ class CryptoBotAPI:
         Верифицирует подпись webhook'а от CryptoBot.
 
         CryptoBot подписывает тело запроса HMAC-SHA256,
-        используя API-токен как ключ. Подпись в заголовке
-        'crypto-pay-api-signature'.
+        используя SHA256(API-токен) как ключ.
+        Подпись в заголовке 'crypto-pay-api-signature'.
+
+        Документация:
+        https://help.send.tg/en/articles/10279948-crypto-pay-api#verifying-webhook-updates
         """
         if not self.token or not signature:
             return False
+        # ⚠️ Важно: секретный ключ = SHA256(API-токен), а не сам токен!
+        secret = hashlib.sha256(self.token.encode("utf-8")).digest()
         expected = hmac.new(
-            self.token.encode("utf-8"),
+            secret,
             body,
             hashlib.sha256,
         ).hexdigest()

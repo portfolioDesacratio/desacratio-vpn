@@ -657,7 +657,7 @@ async def pay_crypto_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     invoice = result["result"]
     invoice_id = invoice["invoice_id"]
-    pay_url = invoice["pay_url"]
+    pay_url = invoice.get("bot_invoice_url") or invoice.get("pay_url", "")
     asset = invoice.get("asset", CRYPTOBOT_ASSET)
     amount_str = invoice.get("amount", amount)
 
@@ -665,7 +665,7 @@ async def pay_crypto_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_pending_crypto(invoice_id, user_id, plan_key)
 
     asset_icon = format_asset_icon(asset)
-    expires_at = invoice.get("expires_at", "через 2 часа")
+    expires_at = invoice.get("expiration_date", "через 2 часа")
 
     text = (
         f"{asset_icon} <b>Счёт на оплату</b>\n\n"
