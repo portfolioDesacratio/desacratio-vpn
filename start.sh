@@ -1,26 +1,20 @@
 #!/bin/bash
 # ─── Desacratio VPN — Startup Script ────────────────────────────────────
-# Запускает API и Telegram бота в одном контейнере.
-# API — HTTP сервер (подписки, .conf)
-# Bot — Telegram поллинг (меню, команды)
-#
-# Render.com: Web Service → Start Command: bash start.sh
+# Запускает API (фон) и Telegram бота (передний план) в одном контейнере.
 # ──────────────────────────────────────────────────────────────────────────
-
-set -e
 
 echo "╔══════════════════════════════════════╗"
 echo "║     🛡️ Desacratio VPN — Startup      ║"
 echo "╚══════════════════════════════════════╝"
 
-# Запускаем API в фоне
-echo "📡 Запуск API на порту ${PORT:-8443}..."
+PORT="${PORT:-8443}"
+echo "📡 Запуск API на порту $PORT..."
 python3 warp-api.py &
 API_PID=$!
 
-# Даём API секунду на старт
-sleep 1
+# Даём API время на запуск
+sleep 2
 
-# Запускаем бота (остаётся на переднем плане — контейнер жив, пока жив бот)
 echo "🤖 Запуск Telegram бота..."
-python3 free-bot.py
+# Bot на переднем плане — контейнер жив, пока жив бот
+exec python3 free-bot.py
