@@ -21,9 +21,17 @@ services:
     branch: main
     plan: free
 
-    # Health check — Render будет пинговать /health каждые 5 минут,
-    # что предотвращает засыпание сервиса на бесплатном тарифе
+    # ⚠️ На бесплатном тарифе Render выключает сервис через 15 мин
+    #    простоя. Бот каждые 5 минут пингует сам себя через публичный URL,
+    #    чтобы Render не выключал его.
     healthCheckPath: /health
+
+    # 💾 Персистентный диск — база данных и кеш НЕ сбрасываются
+    #    при перезапусках и деплоях
+    disk:
+      name: desacratio-data
+      mountPath: /app/data
+      sizeGB: 1
 
     envVars:
       # API (warp-api.py)

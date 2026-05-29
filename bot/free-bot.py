@@ -189,6 +189,28 @@ def make_pricing_text() -> str:
     return "\n".join(lines)
 
 
+# ─── Keep-Alive (бот не даёт Render заснуть) ─────────────────────────────
+
+async def keep_alive_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Каждые 5 минут пингует /health через публичный URL.
+    Render считает это входящим трафиком → не выключает сервис.
+    """
+    if not PUBLIC_URL or "localhost" in PUBLIC_URL:
+        return  # Нет публичного URL — нечего пинговать
+
+    try:
+        req = Request(
+            f"{PUBLIC_URL}/health",
+            headers={"User-Agent": "DesacratioKeepAlive/1.0"},
+        )
+        resp = urlopen(req, timeout=15)
+        status = resp.status
+        logger.debug(f"💓 Keep-alive ping -> {PUBLIC_URL}/health = {status}")
+    except Exception as e:
+        logger.debug(f"Keep-alive ping failed: {e}")
+
+
 # ─── Главное меню /start ────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -907,6 +929,14 @@ def main():
     bot.add_handler(CallbackQueryHandler(refresh_keys, pattern="^refresh_keys$"))
     bot.add_handler(CallbackQueryHandler(dl_conf, pattern="^dl_conf$"))
     bot.add_handler(CallbackQueryHandler(start_trial_cmd, pattern="^start_trial$"))
+
+    # ⏰ Keep-alive: каждые 5 минут пингуем свой health endpoint
+    # чтобы Render не выключал сервис за простой
+    if "localhost" not in PUBLIC_URL and PUBLIC_URL:
+        bot.job_queue.run_repeating(keep_alive_job, interval=300, first=60)
+        logger.info(f"💓 Keep-alive запущен: каждые 5 мин -> {PUBLIC_URL}/health")
+    else:
+        logger.info("💤 Keep-alive отключён (нет публичного URL)")
 
     logger.info(f"🚀 {BRAND} Bot запущен!")
     print(f"╔══════════════════════════════════════╗")
