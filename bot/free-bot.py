@@ -31,11 +31,11 @@ except ImportError:
 # Подключаем БД
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 try:
-from db import (
-    init_db, ensure_user, start_trial, has_active_sub, get_sub_info,
-    get_user, activate_sub, get_all_users, get_stats, PLANS, TRIAL_DAYS,
-    export_db_to_json, restore_db_from_dict
-)
+    from db import (
+        init_db, ensure_user, start_trial, has_active_sub, get_sub_info,
+        get_user, activate_sub, get_all_users, get_stats, PLANS, TRIAL_DAYS,
+        export_db_to_json, restore_db_from_dict
+    )
 except ImportError:
     # Если db.py рядом
     try:
@@ -900,7 +900,7 @@ async def admin_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message or not update.message.reply_to_message.document:
         await update.message.reply_text(
             "❌ Отправь JSON файл бэкапа и reply на него командой <code>/import</code>\n\n"
-            "Или отправь JSON как текст: <code>/import {\\"users\\": [...]}</code>",
+            "Или отправь JSON как текст: <code>/import {\"users\": [...]}</code>",
             parse_mode="HTML"
         )
         return
