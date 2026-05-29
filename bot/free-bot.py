@@ -262,20 +262,22 @@ async def my_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sub_info = get_sub_info(user_id)
     has_sub = has_active_sub(user_id)
 
-    if not has_sub and sub_info["status"] in ("none", "expired_trial", "expired"):
-        # Нет активной подписки — показываем предложение
-        await show_no_sub(update, context, sub_info)
-        return
-
-    # Если есть триал — стартуем его при первом входе
-    if sub_info["status"] == "none":
-        start_trial(user_id)
-        sub_info = get_sub_info(user_id)
-        text = (
-            f"🎁 <b>Пробный период активирован!</b>\n\n"
-            f"У тебя {TRIAL_DAYS} дней бесплатного доступа.\n"
-            f"Пользуйся всеми серверами без ограничений.\n\n"
-        )
+    # Если нет подписки — автостарт триала при первом входе
+    if not has_sub:
+        if sub_info["status"] == "none":
+            # Первый вход — стартуем триал
+            start_trial(user_id)
+            sub_info = get_sub_info(user_id)
+            has_sub = True
+            text = (
+                f"🎁 <b>Пробный период активирован!</b>\n\n"
+                f"У тебя {TRIAL_DAYS} дней бесплатного доступа.\n"
+                f"Пользуйся всеми серверами без ограничений.\n\n"
+            )
+        else:
+            # Триал истёк или подписка истекла
+            await show_no_sub(update, context, sub_info)
+            return
     else:
         text = ""
 
