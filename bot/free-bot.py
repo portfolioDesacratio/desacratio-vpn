@@ -56,10 +56,13 @@ except ImportError:
 # ─── Конфигурация ────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 
-# Приоритет: RENDER_EXTERNAL_URL (авто от Render) → API_BASE → localhost
-RENDER_URL  = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+# Внутренний URL для API (localhost — оба в одном контейнере)
 API_PORT    = os.environ.get("PORT", "8443")
-API_BASE    = os.environ.get("API_BASE", RENDER_URL or f"http://localhost:{API_PORT}")
+API_BASE    = os.environ.get("API_BASE", f"http://localhost:{API_PORT}")
+
+# Внешний URL для подписок (Render устанавливает RENDER_EXTERNAL_URL)
+RENDER_URL  = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+PUBLIC_URL  = os.environ.get("PUBLIC_URL", RENDER_URL or API_BASE)
 
 ADMIN_ID    = int(os.environ.get("ADMIN_ID", "8587090554"))
 
@@ -135,8 +138,8 @@ def api_get_text(path: str, timeout: int = 10) -> str:
 
 
 def get_api_url() -> str:
-    """Возвращает публичный URL API."""
-    return API_BASE
+    """Возвращает публичный URL для подписок (показывается пользователю)."""
+    return PUBLIC_URL
 
 
 async def delete_and_send(update, context, text, keyboard, parse_mode="HTML"):
