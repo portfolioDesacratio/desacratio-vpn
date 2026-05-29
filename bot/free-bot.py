@@ -21,12 +21,12 @@ from urllib.request import urlopen, Request
 from urllib.error import URLError
 
 try:
-    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-    from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, LabeledPrice
+    from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, PreCheckoutQueryHandler, MessageHandler, filters
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "python-telegram-bot", "--break-system-packages"])
-    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-    from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, LabeledPrice
+    from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, PreCheckoutQueryHandler, MessageHandler, filters
 
 # Подключаем БД
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -53,6 +53,16 @@ except ImportError:
         def get_all_users(): return []
         def get_stats(): return {}
 
+
+# ─── Payments Module ──────────────────────────────────────────────────────
+sys.path.insert(0, os.path.dirname(__file__))
+from payments import (
+    CryptoBotAPI, CRYPTOBOT_ENABLED, CRYPTOBOT_ASSET,
+    parse_star_payload, make_star_payload,
+    save_pending_crypto, get_pending_crypto,
+    activate_subscription, notify_user_telegram,
+    STAR_PRICES, format_pricing_text, format_asset_icon,
+)
 
 # ─── Конфигурация ────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
@@ -447,22 +457,407 @@ async def start_trial_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Цены и покупка ──────────────────────────────────────────────────────
 
 async def pricing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает цены."""
+    """Показывает цены и способы оплаты."""
     query = update.callback_query
     await query.answer()
 
     text = (
         f"💎 <b>Тарифы {BRAND}</b>\n\n"
-        f"{make_pricing_text()}"
+        f"{format_pricing_text()}"
     )
 
-    keyboard = [
-        [InlineKeyboardButton("💳 Написать @desacratio", url=f"https://t.me/{PURCHASE_CONTACT[1:]}")],
+    buttons = [
+        [InlineKeyboardButton("⭐️ Telegram Stars", callback_data="pay_stars")],
+    ]
+
+    # CryptoBot — только если настроен токен
+    if CRYPTOBOT_ENABLED:
+        asset_icon = format_asset_icon(CRYPTOBOT_ASSET)
+        buttons.append(
+            [InlineKeyboardButton(f"{asset_icon} Crypto ({CRYPTOBOT_ASSET})", callback_data="pay_crypto")]
+        )
+
+    buttons += [
         [InlineKeyboardButton("📋 Моя подписка", callback_data="my_sub")],
         [InlineKeyboardButton("◀️ Назад", callback_data="back")],
     ]
 
+    await delete_and_send(update, context, text, buttons)
+
+
+# ─── Выбор тарифа (Stars) ────────────────────────────────────────────────
+
+async def pay_stars(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает тарифы для оплаты звёздами."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    text = (
+        f"⭐️ <b>Оплата Telegram Stars</b>\n\n"
+        f"Выбери тариф:\n\n"
+    )
+    for key, stars in STAR_PRICES.items():
+        from db import PLANS
+        plan = PLANS.get(key, {})
+        text += f"▫️ <b>{plan.get('label', key)}</b> — {stars} ⭐\n"
+
+    text += f"\n💳 Спишется со звёзд твоего аккаунта Telegram."
+    text += f"\nПополнить: Настройки → Telegram Stars"
+
+    keyboard = build_plan_keyboard("stars", user_id)
     await delete_and_send(update, context, text, keyboard)
+
+
+async def pay_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает тарифы для оплаты криптой."""
+    if not CRYPTOBOT_ENABLED:
+        await pricing(update, context)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    asset_icon = format_asset_icon(CRYPTOBOT_ASSET)
+    text = (
+        f"{asset_icon} <b>Оплата {CRYPTOBOT_ASSET}</b>\n\n"
+        f"Выбери тариф:\n\n"
+    )
+    from db import PLANS
+    for key, plan in PLANS.items():
+        text += f"▫️ <b>{plan['label']}</b> — {asset_icon} {plan['price_usd']:.2f} {CRYPTOBOT_ASSET}\n"
+
+    text += f"\n🔒 Оплата через @CryptoBot (анонимно)"
+    text += f"\nПосле оплаты подписка активируется автоматически."
+
+    keyboard = build_plan_keyboard("crypto", user_id)
+    await delete_and_send(update, context, text, keyboard)
+
+
+def build_plan_keyboard(method: str, user_id: int) -> list:
+    """Строит клавиатуру выбора тарифа."""
+    from db import PLANS
+    buttons = []
+    row = []
+    for i, (key, plan) in enumerate(PLANS.items()):
+        data = f"{method}_plan_{key}"
+        if method == "stars":
+            stars = STAR_PRICES.get(key, 0)
+            label = f"{plan['label']} — {stars}⭐"
+        else:
+            label = f"{plan['label']} — ${plan['price_usd']:.2f}"
+        row.append(InlineKeyboardButton(label, callback_data=data))
+        if len(row) == 2 or i == len(PLANS) - 1:
+            buttons.append(row)
+            row = []
+    buttons.append([InlineKeyboardButton("◀️ Назад к способам", callback_data="pricing")])
+    return buttons
+
+
+async def pay_stars_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор конкретного тарифа для Stars — отправляет инвойс."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    # Парсим callback: "stars_plan_30days"
+    data = query.data
+    plan_key = data.replace("stars_plan_", "")
+
+    stars = STAR_PRICES.get(plan_key)
+    if not stars:
+        await query.edit_message_text("❌ Неизвестный тариф.", parse_mode="HTML")
+        return
+
+    from db import PLANS
+    plan = PLANS.get(plan_key)
+    if not plan:
+        await query.edit_message_text("❌ Неизвестный тариф.", parse_mode="HTML")
+        return
+
+    payload = make_star_payload(plan_key, user_id)
+
+    try:
+        await context.bot.send_invoice(
+            chat_id=user_id,
+            title=f"{BRAND} — {plan['label']}",
+            description=(
+                f"Премиум VPN подписка на {plan['label'].lower()}.\n"
+                f"🌍 5 стран | 🚀 Без лимитов | 🔐 WireGuard WARP"
+            ),
+            payload=payload,
+            provider_token="",       # Пусто для Telegram Stars (XTR)
+            currency="XTR",
+            prices=[LabeledPrice(plan['label'], stars)],
+            need_name=False,
+            need_phone_number=False,
+            need_email=False,
+            need_shipping_address=False,
+            is_flexible=False,
+        )
+        logger.info(f"⭐️ Star invoice sent: user={user_id}, plan={plan_key}, stars={stars}")
+    except Exception as e:
+        logger.error(f"❌ Star invoice error: {e}")
+        text = (
+            f"❌ <b>Ошибка отправки счёта</b>\n\n"
+            f"{e}\n\n"
+            f"Попробуй позже или напиши {SUPPORT}"
+        )
+        await query.edit_message_text(text, parse_mode="HTML")
+
+
+async def pay_crypto_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор тарифа для CryptoBot — создаёт инвойс."""
+    if not CRYPTOBOT_ENABLED:
+        await pricing(update, context)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    # Парсим callback: "crypto_plan_30days"
+    data = query.data
+    plan_key = data.replace("crypto_plan_", "")
+
+    from db import PLANS
+    plan = PLANS.get(plan_key)
+    if not plan:
+        await query.edit_message_text("❌ Неизвестный тариф.", parse_mode="HTML")
+        return
+
+    amount = f"{plan['price_usd']:.2f}"
+    payload = make_star_payload(plan_key, user_id)  # используем тот же формат
+    description = f"{BRAND} — {plan['label']}"
+
+    # Создаём инвойс через CryptoBot API
+    api = CryptoBotAPI()
+    result = api.create_invoice(
+        amount=amount,
+        payload=payload,
+        description=description,
+        expires_in=7200,  # 2 часа
+    )
+
+    if not result.get("ok"):
+        error_msg = result.get("error", "Неизвестная ошибка")
+        logger.error(f"❌ CryptoBot invoice error: {error_msg}")
+        text = (
+            f"❌ <b>Ошибка создания счёта</b>\n\n"
+            f"{error_msg}\n\n"
+            f"Попробуй позже или напиши {SUPPORT}"
+        )
+        # Пробуем отредактировать сообщение, иначе шлём новое
+        try:
+            await query.edit_message_text(text, parse_mode="HTML")
+        except:
+            await query.message.reply_text(text, parse_mode="HTML")
+        return
+
+    invoice = result["result"]
+    invoice_id = invoice["invoice_id"]
+    pay_url = invoice["pay_url"]
+    asset = invoice.get("asset", CRYPTOBOT_ASSET)
+    amount_str = invoice.get("amount", amount)
+
+    # Сохраняем ожидающий платёж
+    save_pending_crypto(invoice_id, user_id, plan_key)
+
+    asset_icon = format_asset_icon(asset)
+    expires_at = invoice.get("expires_at", "через 2 часа")
+
+    text = (
+        f"{asset_icon} <b>Счёт на оплату</b>\n\n"
+        f"📦 <b>Тариф:</b> {plan['label']}\n"
+        f"💵 <b>Сумма:</b> {amount_str} {asset}\n"
+        f"⏱ <b>Действует:</b> {expires_at}\n\n"
+        f"👇 Нажми кнопку чтобы оплатить через @CryptoBot:\n\n"
+        f"⚠️ <b>Важно:</b> после оплаты подписка активируется "
+        f"автоматически в течение 1-2 минут."
+    )
+
+    keyboard = [
+        [InlineKeyboardButton(f"💳 Оплатить {amount_str} {asset}", url=pay_url)],
+        [InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"check_crypto_{invoice_id}")],
+        [InlineKeyboardButton("◀️ Назад к тарифам", callback_data="pay_crypto")],
+    ]
+
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", disable_web_page_preview=True)
+        await query.message.reply_text(
+            "💳 <b>Ссылка для оплаты:</b>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except:
+        await query.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+
+async def check_crypto_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет статус крипто-платежа."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    # Парсим callback: "check_crypto_123456"
+    invoice_id = int(query.data.replace("check_crypto_", ""))
+
+    api = CryptoBotAPI()
+    result = api.get_invoices(invoice_ids=[invoice_id])
+
+    if not result.get("ok"):
+        await query.message.reply_text(
+            "❌ Не удалось проверить статус. Попробуй позже.",
+            parse_mode="HTML"
+        )
+        return
+
+    invoices = result.get("result", {}).get("items", [])
+    if not invoices:
+        await query.message.reply_text(
+            "❌ Счёт не найден. Возможно, истёк срок действия.",
+            parse_mode="HTML"
+        )
+        return
+
+    invoice = invoices[0]
+    status = invoice.get("status", "unknown")
+
+    if status == "paid":
+        # Активируем подписку
+        pending = get_pending_crypto(invoice_id)
+        if pending:
+            plan_key = pending["plan"]
+            activate_subscription(user_id, plan_key)
+
+            from db import PLANS
+            plan_label = PLANS.get(plan_key, {}).get("label", plan_key)
+            notify_user_telegram(user_id, plan_label, f"CryptoBot ({CRYPTOBOT_ASSET})")
+
+            remove_pending_crypto(invoice_id)
+
+        await query.message.reply_text(
+            f"✅ <b>Оплата подтверждена!</b>\n\n"
+            f"Подписка активирована 🎉\n"
+            f"Нажми «📋 Моя подписка» чтобы начать пользоваться.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 Моя подписка", callback_data="my_sub")
+            ]])
+        )
+    elif status == "expired":
+        await query.message.reply_text(
+            "⏰ <b>Срок счёта истёк</b>\n\n"
+            "Создай новый счёт.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💎 Создать новый счёт", callback_data="pay_crypto")
+            ]])
+        )
+    else:
+        await query.message.reply_text(
+            f"⏳ <b>Статус:</b> ожидание оплаты\n\n"
+            f"Счёт ещё не оплачен. Нажми кнопку «Оплатить» "
+            f"или попробуй проверить позже.",
+            parse_mode="HTML"
+        )
+
+
+# ─── PreCheckout (Stars) ─────────────────────────────────────────────────
+
+async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает PreCheckoutQuery от Telegram Stars.
+    Подтверждает или отклоняет платёж.
+    """
+    query = update.pre_checkout_query
+    payload = query.invoice_payload
+
+    # Проверяем payload
+    parsed = parse_star_payload(payload)
+    if not parsed:
+        logger.warning(f"❌ Invalid star payload: {payload}")
+        await query.answer(ok=False, error_message="Ошибка: неверные данные платежа")
+        return
+
+    plan_key, user_id = parsed
+
+    # Проверяем что план существует
+    stars = STAR_PRICES.get(plan_key)
+    if not stars:
+        logger.warning(f"❌ Unknown plan in star payment: {plan_key}")
+        await query.answer(ok=False, error_message="Ошибка: неизвестный тариф")
+        return
+
+    # Проверяем что сумма совпадает
+    if query.total_amount != stars:
+        logger.warning(
+            f"❌ Star amount mismatch: expected={stars}, got={query.total_amount}"
+        )
+        await query.answer(ok=False, error_message="Ошибка: неверная сумма")
+        return
+
+    # Проверяем что валюта XTR
+    if query.invoice_payload != "XTR" and query.currency != "XTR":
+        # В PTB v22+ валюта в query.currency, проверим
+        pass
+
+    logger.info(f"✅ PreCheckout OK: user={user_id}, plan={plan_key}, stars={stars}")
+    await query.answer(ok=True)
+
+
+async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает успешный платёж Telegram Stars.
+    Активирует подписку и отправляет уведомление.
+    """
+    payment = update.message.successful_payment
+    user_id = update.effective_user.id
+    payload = payment.invoice_payload
+
+    parsed = parse_star_payload(payload)
+    if not parsed:
+        logger.error(f"❌ Cannot parse star payment payload: {payload}")
+        return
+
+    plan_key, _ = parsed
+    from db import PLANS
+    plan_label = PLANS.get(plan_key, {}).get("label", plan_key)
+
+    # Активируем подписку
+    success = activate_subscription(user_id, plan_key)
+
+    if success:
+        text = (
+            f"⭐️ <b>Оплата получена!</b>\n\n"
+            f"📦 <b>Тариф:</b> {plan_label}\n"
+            f"💳 <b>Способ:</b> Telegram Stars\n"
+            f"💰 <b>Списано:</b> {payment.total_amount} ⭐\n\n"
+            f"👇 Нажми чтобы начать пользоваться:"
+        )
+    else:
+        text = (
+            f"⚠️ <b>Оплата прошла, но ошибка активации</b>\n\n"
+            f"Напиши {SUPPORT} — мы поможем!\n"
+            f"Не переживай, звёзды уже списаны."
+        )
+
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📋 Моя подписка", callback_data="my_sub")
+        ]])
+    )
+
+    logger.info(f"⭐️ Star payment successful: user={user_id}, plan={plan_key}")
 
 
 # ─── Обновление ключей ───────────────────────────────────────────────────
@@ -991,6 +1386,19 @@ def main():
     bot.add_handler(CallbackQueryHandler(refresh_keys, pattern="^refresh_keys$"))
     bot.add_handler(CallbackQueryHandler(dl_conf, pattern="^dl_conf$"))
     bot.add_handler(CallbackQueryHandler(start_trial_cmd, pattern="^start_trial$"))
+
+    # 💳 Оплата
+    bot.add_handler(CallbackQueryHandler(pay_stars, pattern="^pay_stars$"))
+    bot.add_handler(CallbackQueryHandler(pay_crypto, pattern="^pay_crypto$"))
+    bot.add_handler(CallbackQueryHandler(pay_stars_plan, pattern=r"^stars_plan_"))
+    bot.add_handler(CallbackQueryHandler(pay_crypto_plan, pattern=r"^crypto_plan_"))
+    bot.add_handler(CallbackQueryHandler(check_crypto_payment, pattern=r"^check_crypto_"))
+
+    # PreCheckout (Stars) — должен быть ДО MessageHandler
+    bot.add_handler(PreCheckoutQueryHandler(pre_checkout))
+
+    # Successful Payment (Stars)
+    bot.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
     # ⏰ Keep-alive: каждые 5 минут пингуем свой health endpoint
     # чтобы Render не выключал сервис за простой

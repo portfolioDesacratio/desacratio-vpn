@@ -40,6 +40,24 @@ except ImportError:
     def ensure_user(*a): pass
     def init_db(): pass
 
+# ─── CryptoBot Payment Webhook ──────────────────────────────────────────
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))  # /app/
+try:
+    from payments import (
+        CryptoBotAPI, get_pending_crypto, remove_pending_crypto,
+        activate_subscription, notify_user_telegram,
+        CRYPTOBOT_ENABLED, CRYPTOBOT_ASSET,
+    )
+except ImportError:
+    # Если модуль не загрузился — webhook просто вернёт ошибку
+    CryptoBotAPI = None
+    def get_pending_crypto(*a): return None
+    def remove_pending_crypto(*a): pass
+    def activate_subscription(*a): return False
+    def notify_user_telegram(*a): pass
+    CRYPTOBOT_ENABLED = False
+    CRYPTOBOT_ASSET = "USDT"
+
 # ─── Flask ───────────────────────────────────────────────────────────────
 try:
     from flask import Flask, jsonify, request, Response
@@ -512,6 +530,84 @@ def refresh_subscription(user_id: str):
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ─── CryptoBot Webhook ───────────────────────────────────────────────────
+
+@app.route("/cryptobot_webhook", methods=["POST"])
+def cryptobot_webhook():
+    """
+    Webhook для CryptoBot (@send).
+    CryptoBot присылает сюда уведомления об оплате счетов.
+    Документация: https://help.crypt.bot/crypto-pay-api#webhook
+    """
+    if not CRYPTOBOT_ENABLED or CryptoBotAPI is None:
+        return jsonify({"error": "CryptoBot not configured"}), 503
+
+    # Получаем подпись из заголовка
+    signature = request.headers.get("crypto-pay-api-signature", "")
+    body = request.get_data()
+
+    # Верифицируем подпись
+    api = CryptoBotAPI()
+    if not api.verify_webhook(body, signature):
+        logger.warning("⚠️ CryptoBot webhook: invalid signature")
+        return jsonify({"error": "invalid signature"}), 403
+
+    # Парсим тело
+    try:
+        data = request.get_json(force=True)
+    except Exception as e:
+        logger.error(f"⚠️ CryptoBot webhook: invalid JSON: {e}")
+        return jsonify({"error": "invalid json"}), 400
+
+    # Проверяем что это обновление инвойса
+    update_type = data.get("update_type", "")
+    if update_type not in ("invoice_paid", "invoice_activated"):
+        # Нас интересуют только оплаченные счета
+        return jsonify({"ok": True})
+
+    payload_data = data.get("payload", {})
+    invoice_id = payload_data.get("invoice_id")
+
+    if not invoice_id:
+        logger.warning("⚠️ CryptoBot webhook: no invoice_id")
+        return jsonify({"error": "no invoice_id"}), 400
+
+    # Проверяем статус
+    status = payload_data.get("status", "")
+    if status != "paid":
+        logger.info(f"ℹ️ CryptoBot webhook: invoice {invoice_id} status={status}")
+        return jsonify({"ok": True})
+
+    # Ищем ожидающий платёж
+    pending = get_pending_crypto(invoice_id)
+    if not pending:
+        logger.warning(f"⚠️ CryptoBot webhook: invoice {invoice_id} not found in pending")
+        return jsonify({"ok": True})  # Уже могли обработать
+
+    user_id = pending["user_id"]
+    plan_key = pending["plan"]
+
+    # Активируем подписку
+    success = activate_subscription(user_id, plan_key)
+
+    if success:
+        from db import PLANS
+        plan_label = PLANS.get(plan_key, {}).get("label", plan_key)
+        notify_user_telegram(user_id, plan_label, f"CryptoBot ({CRYPTOBOT_ASSET})")
+        remove_pending_crypto(invoice_id)
+        logger.info(
+            f"✅ CryptoBot webhook: sub activated user={user_id} "
+            f"plan={plan_key} invoice={invoice_id}"
+        )
+    else:
+        logger.error(
+            f"❌ CryptoBot webhook: activation failed user={user_id} "
+            f"plan={plan_key} invoice={invoice_id}"
+        )
+
+    return jsonify({"ok": True})
 
 
 # ─── Запуск ──────────────────────────────────────────────────────────────

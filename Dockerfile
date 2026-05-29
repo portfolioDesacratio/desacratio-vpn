@@ -28,6 +28,7 @@ COPY api/relay_proxy.py ./api/
 # ─── Bot ────────────────────────────────────────────────────────────────
 COPY bot/requirements.txt ./requirements-bot.txt
 COPY bot/free-bot.py ./
+COPY bot/payments.py ./
 
 # ─── Startup ────────────────────────────────────────────────────────────
 COPY start.sh ./
