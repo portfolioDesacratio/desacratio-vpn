@@ -15,7 +15,7 @@ import hashlib
 import logging
 from datetime import datetime
 from urllib.request import Request, urlopen
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 
 logger = logging.getLogger("desacratio-payments")
 
@@ -114,6 +114,18 @@ class CryptoBotAPI:
             req = Request(url, data=body, headers=headers, method="POST")
             with urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode())
+        except HTTPError as e:
+            # Пробуем прочитать тело ответа — там может быть детальная ошибка
+            error_body = ""
+            try:
+                error_body = e.read().decode()[:500]
+            except:
+                pass
+            msg = f"HTTP {e.code}: {e.reason}"
+            if error_body:
+                msg += f" | {error_body}"
+            logger.error(f"🌐 CryptoBot API error ({method}): {msg}")
+            return {"ok": False, "error": msg, "code": e.code}
         except URLError as e:
             logger.error(f"🌐 CryptoBot API error ({method}): {e}")
             return {"ok": False, "error": str(e)}
