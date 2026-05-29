@@ -59,6 +59,7 @@ RATE_LIMIT    = int(os.environ.get("RATE_LIMIT", "20"))
 CACHE_TTL     = int(os.environ.get("CACHE_TTL", "86400"))
 SERVERS_CNT   = int(os.environ.get("SERVERS_COUNT", "5"))
 DATA_DIR      = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
+ADMIN_ID      = int(os.environ.get("ADMIN_ID", "8587090554"))
 
 # Branding
 BRAND      = "Desacratio VPN"
@@ -281,6 +282,11 @@ def require_subscription(f):
                 user_id = int(user_id)
             except ValueError:
                 pass
+
+            # Администратор имеет доступ без подписки
+            if user_id == ADMIN_ID:
+                return f(*args, **kwargs)
+
             if not has_active_sub(user_id):
                 sub_info = get_sub_info(user_id)
                 return jsonify({
