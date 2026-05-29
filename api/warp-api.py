@@ -279,13 +279,17 @@ def require_subscription(f):
         user_id = kwargs.get("user_id")
         if user_id:
             try:
+                original_id = user_id
                 user_id = int(user_id)
             except ValueError:
                 pass
 
             # Администратор имеет доступ без подписки
             if user_id == ADMIN_ID:
+                logger.info(f"🔑 Админский доступ для {user_id} (ADMIN_ID={ADMIN_ID})")
                 return f(*args, **kwargs)
+            else:
+                logger.debug(f"Пользователь {user_id} != ADMIN_ID {ADMIN_ID}")
 
             if not has_active_sub(user_id):
                 sub_info = get_sub_info(user_id)
@@ -360,6 +364,7 @@ def health():
         "servers":  SERVERS_CNT,
         "uptime":   time.time() - app_start_time,
         "version":  "3.0",
+        "admin_id": ADMIN_ID,
     })
 
 
