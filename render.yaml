@@ -44,3 +44,4 @@ services:
       # Secrets (вводятся вручную при деплое)
       - key: BOT_TOKEN
         sync: false    # Render попросит ввести значение
+
