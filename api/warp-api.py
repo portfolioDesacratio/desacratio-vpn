@@ -309,7 +309,7 @@ def clear_user_cache(user_id: str) -> bool:
 
 def format_singbox(configs: list, user_id: str) -> dict:
     """
-    Формат Sing-box JSON (Hiddify, Streisand, Nekoray).
+    Формат Sing-box JSON (Happ, Hiddify, Sing-box, Streisand, Nekoray).
     """
     outbounds = []
     for cfg in configs:
@@ -333,7 +333,6 @@ def format_singbox(configs: list, user_id: str) -> dict:
         })
 
     return {
-        "version": 2,
         "outbounds": outbounds,
     }
 
@@ -343,6 +342,7 @@ def format_clash(configs: list, user_id: str) -> dict:
     Формат Clash Meta (Happ, v2rayTun, Clash Meta).
     """
     proxies = []
+    proxy_names = []
     for cfg in configs:
         server_host = cfg["endpoint"].rsplit(":", 1)[0]
         server_port = int(cfg["endpoint"].rsplit(":", 1)[1])
@@ -351,21 +351,48 @@ def format_clash(configs: list, user_id: str) -> dict:
         except:
             reserved = [0, 0, 0]
 
+        name = f"{cfg['flag']} {cfg['name']}"
+        proxy_names.append(name)
+
         proxies.append({
-            "name": f"{cfg['flag']} {cfg['name']}",
-            "type": "wireguard",
+            "name": name,
+            "type": "WireGuard",
             "server": server_host,
             "port": server_port,
             "ip": cfg["v4"],
             "ipv6": cfg["v6"],
             "private-key": cfg["private_key"],
             "public-key": cfg["public_key"],
-            "reserved": reserved,
+            "reserved": ",".join(str(r) for r in reserved),
             "udp": True,
             "mtu": 1280,
         })
 
-    return {"proxies": proxies}
+    return {
+        "port": 7890,
+        "socks-port": 7891,
+        "allow-lan": False,
+        "mode": "Rule",
+        "log-level": "warning",
+        "proxies": proxies,
+        "proxy-groups": [
+            {
+                "name": "Proxy",
+                "type": "select",
+                "proxies": ["🔀 Авто"] + proxy_names,
+            },
+            {
+                "name": "🔀 Авто",
+                "type": "url-test",
+                "proxies": proxy_names,
+                "url": "http://www.gstatic.com/generate_204",
+                "interval": 300,
+            },
+        ],
+        "rules": [
+            "MATCH,Proxy",
+        ],
+    }
 
 
 def format_wg_conf_all(configs: list, user_id: str) -> str:
