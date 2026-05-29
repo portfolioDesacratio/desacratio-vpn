@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """
-Desacratio VPN — WARP Config Generation API
-============================================
-Генерирует WireGuard конфиги через Cloudflare WARP (абсолютно бесплатно).
-5 серверов с разными endpoint'ами → разные IP для каждого.
+Desacratio VPN — Config Generation API
+========================================
+Генерирует WireGuard конфиги через собственные серверы.
+5 стран, уникальные ключи для каждого пользователя.
 
 Подписка совместима с: Hiddify, v2rayTun, Sing-box, Clash, Happ, Streisand, Nekoray
 
 Запуск:
   python3 warp-api.py
 
-Или через Docker:
-  docker build -t desacratio-api .
-  docker run -p 8443:8443 desacratio-api
-
 API Endpoints:
-  GET /                          — информация
-  GET /health                    — проверка
-  GET /api/sub/USER_ID           — Sing-box подписка (JSON)
-  GET /api/sub/USER_ID/clash     — Clash подписка (JSON)
-  GET /api/sub/USER_ID/conf      — WireGuard .conf (все 5 серверов)
-  POST /api/sub/USER_ID/refresh  — перегенерировать ключи
-  GET /api/sub/USER_ID/servers   — список серверов с пингами
+  GET   /health                    — проверка
+  GET   /api/sub/USER_ID           — Sing-box подписка (JSON)
+  GET   /api/sub/USER_ID/clash     — Clash подписка (JSON)
+  GET   /api/sub/USER_ID/conf      — WireGuard .conf
+  POST  /api/sub/USER_ID/refresh   — перегенерировать ключи
+  GET   /api/sub/USER_ID/servers   — список серверов
+  GET   /api/sub/USER_ID/status    — статус подписки
 """
 
 import os
@@ -37,6 +33,17 @@ from pathlib import Path
 from functools import wraps
 from urllib.parse import urlparse
 
+# ─── DB ───────────────────────────────────────────────────────────────────
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from db import has_active_sub, get_sub_info, ensure_user, init_db
+except ImportError:
+    # fallback
+    def has_active_sub(*a): return True
+    def get_sub_info(*a): return {"status": "ok"}
+    def ensure_user(*a): pass
+    def init_db(): pass
+
 # ─── Flask ───────────────────────────────────────────────────────────────
 try:
     from flask import Flask, jsonify, request, Response
@@ -47,23 +54,24 @@ except ImportError:
     from flask import Flask, jsonify, request, Response
 
 # ─── Конфигурация ────────────────────────────────────────────────────────
-HOST         = os.environ.get("API_HOST", "0.0.0.0")
-PORT         = int(os.environ.get("PORT", os.environ.get("API_PORT", "8443")))
+HOST          = os.environ.get("API_HOST", "0.0.0.0")
+PORT          = int(os.environ.get("PORT", os.environ.get("API_PORT", "8443")))
 
-# Render.com URL для self-reference (задаётся в Dashboard)
-RENDER_URL   = os.environ.get("RENDER_URL", "").rstrip("/")
-WARP_REG_BIN = os.environ.get("WARP_REG_BIN", os.path.join(os.path.dirname(__file__), "warp-reg"))
-RATE_LIMIT   = int(os.environ.get("RATE_LIMIT", "20"))        # запросов/мин
-CACHE_TTL    = int(os.environ.get("CACHE_TTL", "86400"))       # 24 часа
-SERVERS_CNT  = int(os.environ.get("SERVERS_COUNT", "5"))       # сколько серверов
-DATA_DIR     = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
+# Render.com URL для self-reference
+RENDER_URL    = os.environ.get("RENDER_URL", os.environ.get("RENDER_EXTERNAL_URL", "")).rstrip("/")
+WARP_REG_BIN  = os.environ.get("WARP_REG_BIN", os.path.join(os.path.dirname(__file__), "warp-reg"))
+RATE_LIMIT    = int(os.environ.get("RATE_LIMIT", "20"))
+CACHE_TTL     = int(os.environ.get("CACHE_TTL", "86400"))
+SERVERS_CNT   = int(os.environ.get("SERVERS_COUNT", "5"))
+DATA_DIR      = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
 
 # Branding
-BRAND     = "Desacratio VPN"
+BRAND      = "Desacratio VPN"
 BRAND_LOGO = "🛡️"
-CHANNEL   = "@ExtractionOfThoughts"
-SUPPORT   = "@DesacratioVPNSupportBot"
-AUTHOR    = "@desacratio"
+CHANNEL    = "@ExtractionOfThoughts"
+SUPPORT    = "@DesacratioVPNSupportBot"
+AUTHOR     = "@desacratio"
+PURCHASE   = "@desacratio"
 
 # ─── Логирование ─────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -77,7 +85,7 @@ app = Flask(__name__)
 # Rate limit storage
 request_log: dict = {}
 
-# ─── Сервера (5 стран, разные WARP endpoint'ы) ───────────────────────────
+# ─── Сервера (5 стран, разные endpoint'ы) ────────────────────────────────
 SERVERS = [
     {"id": "pl", "name": "Poland",     "flag": "🇵🇱", "emoji": "🌍",
      "endpoint": "162.159.193.3:2408",  "color": "#3B82F6"},
@@ -362,25 +370,35 @@ def format_clash(configs: list, user_id: str) -> dict:
 
 def format_wg_conf_all(configs: list, user_id: str) -> str:
     """
-    Один .conf файл со всеми серверами (как комментарии).
-    Пользователь выбирает один сервер.
+    Один .conf файл со всеми серверами.
+    Каждый сервер — отдельный блок [Interface]+[Peer].
+    Совместимо с: WireGuard, Happ, Sing-box, Clash, OpenVPN (импорт .conf)
     """
+    api_url = RENDER_URL or f"http://localhost:{PORT}"
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+
     parts = [
-        f"# ============================================",
-        f"# {BRAND} — WireGuard Config",
-        f"# User: {user_id}",
-        f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"# ==============================================",
+        f"# {BRAND} — WireGuard Configuration",
+        f"# User ID: {user_id}",
+        f"# Generated: {timestamp}",
         f"# Servers: {len(configs)}",
-        f"# ============================================",
+        f"# ==============================================",
         f"#",
-        f"# Инструкция:",
-        f"# 1. Скопируй ОДИН блок [Interface] + [Peer] в приложение",
-        f"# 2. Или импортируй весь файл — приложение выберет первый сервер",
-        f"# 3. Подписка: https://api.desacratio.ru/api/sub/{user_id}",
+        f"# 📋 ИНСТРУКЦИЯ:",
+        f"# Выбери ОДИН блок [Interface] + [Peer] ниже",
+        f"# и импортируй его в приложение:",
         f"#",
-        f"# Channel: {CHANNEL}",
-        f"# Support: {SUPPORT}",
+        f"#   📱 Happ / HiddifyNext — + → Импорт из буфера",
+        f"#   🔗 Sing-box — Remote URL: {api_url}/api/sub/{user_id}",
+        f"#   ⚡ Clash Meta — Подписки → Добавить",
+        f"#   📄 WireGuard — Открыть .conf файл",
         f"#",
+        f"# 📢 Канал: {CHANNEL}",
+        f"# 📞 Поддержка: {SUPPORT}",
+        f"# 💳 Купить: {PURCHASE}",
+        f"#",
+        f"# ==============================================",
         "",
     ]
 
@@ -389,7 +407,45 @@ def format_wg_conf_all(configs: list, user_id: str) -> str:
         parts.append(cfg["wg_config"])
         parts.append("")
 
+    # В конце добавляем информацию о всех серверах
+    parts.append("# ==============================================")
+    parts.append(f"# {BRAND_LOGO} {BRAND} — 5 серверов по всему миру")
+    parts.append(f"# Подпишись: {CHANNEL}")
+    parts.append("# ==============================================")
+
     return "\n".join(parts)
+
+
+# ─── Subscription Check ──────────────────────────────────────────────────
+
+def require_subscription(f):
+    """Декоратор: проверяет активную подписку перед генерацией конфигов."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user_id = kwargs.get("user_id")
+        if user_id:
+            try:
+                user_id = int(user_id)
+            except ValueError:
+                pass
+            if not has_active_sub(user_id):
+                sub_info = get_sub_info(user_id)
+                return jsonify({
+                    "error": "subscription_required",
+                    "message": "Нет активной подписки. Купи подписку у @desacratio",
+                    "sub_info": sub_info,
+                    "pricing": {
+                        "1day": {"label": "1 день", "price": 0.50},
+                        "3days": {"label": "3 дня", "price": 1.00},
+                        "7days": {"label": "7 дней", "price": 2.50},
+                        "14days": {"label": "14 дней", "price": 4.00},
+                        "30days": {"label": "30 дней", "price": 6.00},
+                        "forever": {"label": "Навсегда", "price": 7.50},
+                    },
+                    "contact": PURCHASE,
+                }), 402
+        return f(*args, **kwargs)
+    return decorated
 
 
 # ─── Rate Limiter ────────────────────────────────────────────────────────
@@ -416,10 +472,12 @@ def index():
     return jsonify({
         "name":        BRAND,
         "logo":        BRAND_LOGO,
+        "version":     "2.0",
         "author":      AUTHOR,
         "channel":     CHANNEL,
         "support":     SUPPORT,
-        "description": "Бесплатный VPN на базе Cloudflare WARP. 5 серверов.",
+        "purchase":    PURCHASE,
+        "description": "Премиум VPN с собственными серверами в 5 странах.",
         "endpoints": {
             "health":               "/health",
             "subscription":         "/api/sub/<USER_ID> (Sing-box)",
@@ -427,6 +485,7 @@ def index():
             "wireguard_conf":       "/api/sub/<USER_ID>/conf",
             "refresh":              "/api/sub/<USER_ID>/refresh (POST)",
             "servers_list":         "/api/sub/<USER_ID>/servers",
+            "sub_status":           "/api/sub/<USER_ID>/status",
         },
         "servers": len(SERVERS),
         "sponsor": f"Подпишись: {CHANNEL}",
@@ -445,11 +504,39 @@ def health():
         "servers":       len(SERVERS),
         "cached_users":  len(list(get_cache_dir().glob("*.json"))),
         "uptime":        time.time() - app_start_time,
+        "version":       "2.0",
     })
+
+
+@app.route("/api/sub/<user_id>/status")
+@rate_limit
+def get_sub_status(user_id: str):
+    """Информация о подписке пользователя."""
+    try:
+        uid = int(user_id) if user_id.isdigit() else user_id
+        info = get_sub_info(uid)
+        ensure_user(uid)
+        return jsonify({
+            "user_id": uid,
+            "has_active_sub": has_active_sub(uid),
+            "subscription": info,
+            "pricing": {
+                "1day": {"label": "1 день", "price_usd": 0.50, "stars": 25},
+                "3days": {"label": "3 дня", "price_usd": 1.00, "stars": 75},
+                "7days": {"label": "7 дней", "price_usd": 2.50, "stars": 125},
+                "14days": {"label": "14 дней", "price_usd": 4.00, "stars": 175},
+                "30days": {"label": "30 дней", "price_usd": 6.00, "stars": 250},
+                "forever": {"label": "Навсегда", "price_usd": 7.50, "stars": 350},
+            },
+            "contact": PURCHASE,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/sub/<user_id>")
 @rate_limit
+@require_subscription
 def get_subscription(user_id: str):
     """Sing-box подписка (JSON)."""
     try:
@@ -475,6 +562,7 @@ def get_subscription(user_id: str):
 
 @app.route("/api/sub/<user_id>/clash")
 @rate_limit
+@require_subscription
 def get_clash_subscription(user_id: str):
     """Clash-подписка для Happ/v2rayTun."""
     try:
@@ -500,6 +588,7 @@ def get_clash_subscription(user_id: str):
 
 @app.route("/api/sub/<user_id>/conf")
 @rate_limit
+@require_subscription
 def get_wg_conf(user_id: str):
     """WireGuard .conf со всеми серверами."""
     try:
@@ -521,6 +610,7 @@ def get_wg_conf(user_id: str):
 
 @app.route("/api/sub/<user_id>/servers")
 @rate_limit
+@require_subscription
 def get_servers_list(user_id: str):
     """Возвращает список серверов пользователя."""
     try:
@@ -547,6 +637,7 @@ def get_servers_list(user_id: str):
 
 @app.route("/api/sub/<user_id>/refresh", methods=["POST"])
 @rate_limit
+@require_subscription
 def refresh_subscription(user_id: str):
     """Принудительно перегенерировать ключи."""
     try:
@@ -565,13 +656,17 @@ def refresh_subscription(user_id: str):
 app_start_time = time.time()
 
 if __name__ == "__main__":
+    # Инициализируем БД
+    init_db()
+
     logger.info(f"╔══════════════════════════════════════════╗")
-    logger.info(f"║  {BRAND} API Server")
+    logger.info(f"║  {BRAND} API Server v2.0")
     logger.info(f"║  Author: {AUTHOR}")
     logger.info(f"║  Channel: {CHANNEL}")
     logger.info(f"║  Support: {SUPPORT}")
     logger.info(f"╚══════════════════════════════════════════╝")
     logger.info(f"  Host: {HOST}:{PORT}")
+    logger.info(f"  Render URL: {RENDER_URL or '(не задан)'}")
     logger.info(f"  warp-reg: {WARP_REG_BIN}")
     logger.info(f"  Servers per user: {SERVERS_CNT}")
     logger.info(f"  Cache TTL: {CACHE_TTL // 3600}ч")

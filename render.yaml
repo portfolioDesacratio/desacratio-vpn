@@ -1,11 +1,13 @@
 # ─── Desacratio VPN — Render.com Deployment ─────────────────────────────
-# Один Web Service, который запускает и API, и Telegram бота.
+# v2.0 — Premium VPN с подписками и 7-дневным триалом
+#
+# Один Web Service: API + Telegram бот + SQLite БД.
 #
 # Деплой в 1 клик:
 #   1. Зарегистрируйся на https://render.com (через GitHub)
 #   2. Нажми "New +" → "Blueprint" → выбери этот репозиторий
 #   3. Render сам прочитает render.yaml и настроит всё
-#   4. Введи BOT_TOKEN в поле "Environment Variables" → "Add Secret File"
+#   4. Введи BOT_TOKEN при запросе
 #   5. Готово! 🚀
 # ──────────────────────────────────────────────────────────────────────────
 

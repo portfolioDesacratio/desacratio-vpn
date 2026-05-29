@@ -13,6 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# ─── Shared DB ──────────────────────────────────────────────────────────
+COPY db.py ./
+
 # ─── API ────────────────────────────────────────────────────────────────
 COPY api/requirements.txt ./requirements-api.txt
 COPY api/warp-api.py ./

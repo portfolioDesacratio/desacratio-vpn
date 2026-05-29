@@ -21,6 +21,8 @@ Thumbs.db
 # Data cache (generated at runtime)
 api/data/cache/
 data/cache/
+data/*.db
+*.db
 
 # Binary (tracked, so don't ignore but keep here for reference)
 # warp-reg
