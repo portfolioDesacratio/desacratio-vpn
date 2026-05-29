@@ -1,0 +1,44 @@
+# ─── Desacratio VPN — Render.com Deployment ─────────────────────────────
+# Один Web Service, который запускает и API, и Telegram бота.
+#
+# Деплой в 1 клик:
+#   1. Зарегистрируйся на https://render.com (через GitHub)
+#   2. Нажми "New +" → "Blueprint" → выбери этот репозиторий
+#   3. Render сам прочитает render.yaml и настроит всё
+#   4. Введи BOT_TOKEN в поле "Environment Variables" → "Add Secret File"
+#   5. Готово! 🚀
+# ──────────────────────────────────────────────────────────────────────────
+
+version: "1"
+services:
+  - type: web
+    name: desacratio-vpn
+    env: docker
+    dockerfilePath: ./Dockerfile
+    repo: https://github.com/kall1shnik0vv/desacratio-vpn
+    branch: main
+    plan: free
+
+    # Health check — Render будет пинговать /health каждые 5 минут,
+    # что предотвращает засыпание сервиса на бесплатном тарифе
+    healthCheckPath: /health
+
+    envVars:
+      # API (warp-api.py)
+      - key: DATA_DIR
+        value: /app/data
+      - key: CACHE_TTL
+        value: "86400"
+      - key: SERVERS_COUNT
+        value: "5"
+      - key: RATE_LIMIT
+        value: "20"
+
+      # Bot (free-bot.py)
+      # API_BASE не нужен — бот сам определяет localhost:PORT
+      - key: ADMIN_ID
+        value: "8587090554"
+
+      # Secrets (вводятся вручную при деплое)
+      - key: BOT_TOKEN
+        sync: false    # Render попросит ввести значение

@@ -1,0 +1,29 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Env files
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data cache (generated at runtime)
+api/data/cache/
+data/cache/
+
+# Binary (tracked, so don't ignore but keep here for reference)
+# warp-reg
+
+# Docker
+.dockerignore
