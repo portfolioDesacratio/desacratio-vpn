@@ -1320,6 +1320,91 @@ async def admin_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
+async def admin_test_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тест CryptoBot подключения (только для админа)."""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+
+    if not CRYPTOBOT_ENABLED:
+        await update.message.reply_text("❌ CRYPTOBOT_TOKEN не задан")
+        return
+
+    await update.message.reply_text("🔄 Тестирую CryptoBot API...")
+
+    api = CryptoBotAPI()
+
+    # Тест getMe
+    try:
+        me = api.get_me()
+        if me.get("ok"):
+            app_name = me["result"].get("name", "?")
+            app_id = me["result"].get("app_id", "?")
+            await update.message.reply_text(
+                f"✅ <b>getMe OK</b>\n"
+                f"📱 App: {app_name}\n"
+                f"🆔 ID: {app_id}",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ <b>getMe failed</b>\n{me.get('error', '?')}",
+                parse_mode="HTML"
+            )
+            return
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка getMe: {e}")
+        return
+
+    # Тест getBalance
+    try:
+        balance = api.get_balance()
+        if balance.get("ok"):
+            items = balance.get("result", [])
+            if items:
+                text = "💰 <b>Баланс:</b>\n"
+                for item in items:
+                    text += f"  {item['asset']}: {item['available']}\n"
+            else:
+                text = "💰 Баланс пуст"
+            await update.message.reply_text(text, parse_mode="HTML")
+        else:
+            await update.message.reply_text(
+                f"❌ getBalance failed: {balance.get('error', '?')}",
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка getBalance: {e}")
+
+    # Тест createInvoice (0.01 USDT)
+    try:
+        invoice = api.create_invoice(
+            amount="0.01",
+            payload="test_invoice",
+            description="Test invoice — delete me",
+            expires_in=60,  # 1 минута
+        )
+        if invoice.get("ok"):
+            inv = invoice["result"]
+            url = inv.get("bot_invoice_url", inv.get("pay_url", "?"))
+            await update.message.reply_text(
+                f"✅ <b>createInvoice OK</b>\n"
+                f"🆔 Invoice ID: {inv['invoice_id']}\n"
+                f"🔗 {url}",
+                parse_mode="HTML"
+            )
+            # Сразу удаляем тестовый инвойс
+            api._request("deleteInvoice", {"invoice_id": inv["invoice_id"]})
+        else:
+            await update.message.reply_text(
+                f"❌ <b>createInvoice failed</b>\n{invoice.get('error', '?')}",
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка createInvoice: {e}")
+
+
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Помощь по админ-командам."""
     user_id = update.effective_user.id
@@ -1335,6 +1420,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<code>/add &lt;user_id&gt; &lt;plan&gt;</code> — активировать подписку\n"
         f"<code>/export</code> — выгрузить БД (перед деплоем)\n"
         f"<code>/import</code> — загрузить БД (reply на JSON файл)\n"
+        f"<code>/test_crypto</code> — диагностика CryptoBot\n"
         f"<code>/admin</code> — эта справка\n\n"
         f"📦 <b>Планы:</b>\n{plans}"
     )
@@ -1370,6 +1456,7 @@ def main():
     bot.add_handler(CommandHandler("add", admin_add))
     bot.add_handler(CommandHandler("export", admin_export))
     bot.add_handler(CommandHandler("import", admin_import))
+    bot.add_handler(CommandHandler("test_crypto", admin_test_crypto))
     bot.add_handler(CommandHandler("admin", admin_help))
 
     # Навигация
