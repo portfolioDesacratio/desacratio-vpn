@@ -31,10 +31,11 @@ except ImportError:
 # Подключаем БД
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 try:
-    from db import (
-        init_db, ensure_user, start_trial, has_active_sub, get_sub_info,
-        get_user, activate_sub, get_all_users, get_stats, PLANS, TRIAL_DAYS
-    )
+from db import (
+    init_db, ensure_user, start_trial, has_active_sub, get_sub_info,
+    get_user, activate_sub, get_all_users, get_stats, PLANS, TRIAL_DAYS,
+    export_db_to_json, restore_db_from_dict
+)
 except ImportError:
     # Если db.py рядом
     try:
@@ -867,6 +868,63 @@ async def admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def admin_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экспорт БД в JSON (перед деплоем)."""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+
+    data = export_db_to_json()
+    text = json.dumps(data, indent=2, ensure_ascii=False, default=str)
+
+    # Отправляем как файл
+    file = io.BytesIO(text.encode())
+    await update.message.reply_document(
+        document=InputFile(file, filename=f"desacratio-backup-{int(time.time())}.json"),
+        caption=f"📦 <b>Бэкап БД</b>\n"
+                f"Пользователей: {len(data['users'])}\n"
+                f"Покупок: {len(data['purchases'])}",
+        parse_mode="HTML"
+    )
+
+
+async def admin_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Импорт БД из JSON (после деплоя). /import (reply на JSON файл)"""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+
+    # Проверяем reply на документ
+    if not update.message.reply_to_message or not update.message.reply_to_message.document:
+        await update.message.reply_text(
+            "❌ Отправь JSON файл бэкапа и reply на него командой <code>/import</code>\n\n"
+            "Или отправь JSON как текст: <code>/import {\\"users\\": [...]}</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        # Скачиваем файл
+        doc = update.message.reply_to_message.document
+        file = await doc.get_file()
+        content = await file.download_as_bytearray()
+        data = json.loads(content.decode())
+
+        if restore_db_from_dict(data):
+            await update.message.reply_text(
+                f"✅ <b>БД восстановлена!</b>\n"
+                f"Пользователей: {len(data.get('users', []))}\n"
+                f"Покупок: {len(data.get('purchases', []))}",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text("❌ Ошибка восстановления БД")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Помощь по админ-командам."""
     user_id = update.effective_user.id
@@ -880,6 +938,8 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<code>/stats</code> — статистика\n"
         f"<code>/list</code> — список пользователей\n"
         f"<code>/add &lt;user_id&gt; &lt;plan&gt;</code> — активировать подписку\n"
+        f"<code>/export</code> — выгрузить БД (перед деплоем)\n"
+        f"<code>/import</code> — загрузить БД (reply на JSON файл)\n"
         f"<code>/admin</code> — эта справка\n\n"
         f"📦 <b>Планы:</b>\n{plans}"
     )
@@ -913,6 +973,8 @@ def main():
     bot.add_handler(CommandHandler("stats", admin_stats))
     bot.add_handler(CommandHandler("list", admin_list))
     bot.add_handler(CommandHandler("add", admin_add))
+    bot.add_handler(CommandHandler("export", admin_export))
+    bot.add_handler(CommandHandler("import", admin_import))
     bot.add_handler(CommandHandler("admin", admin_help))
 
     # Навигация

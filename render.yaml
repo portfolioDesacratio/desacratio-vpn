@@ -21,17 +21,13 @@ services:
     branch: main
     plan: free
 
-    # ⚠️ На бесплатном тарифе Render выключает сервис через 15 мин
-    #    простоя. Бот каждые 5 минут пингует сам себя через публичный URL,
-    #    чтобы Render не выключал его.
+    # 💓 Self-ping: бот каждые 5 мин пингует /health через публичный URL,
+    #    чтобы Render не выключал сервис за простой (free tier)
     healthCheckPath: /health
 
-    # 💾 Персистентный диск — база данных и кеш НЕ сбрасываются
-    #    при перезапусках и деплоях
-    disk:
-      name: desacratio-data
-      mountPath: /app/data
-      sizeGB: 1
+    # 💾 База SQLite и кеш хранятся в /app/data/
+    #    На free tier данные живут пока жив контейнер (переживают restart,
+    #    но НЕ переживают re-deploy). Перед деплоем сделай /export в боте.
 
     envVars:
       # API (warp-api.py)

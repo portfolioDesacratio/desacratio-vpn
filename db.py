@@ -71,6 +71,11 @@ def init_db():
     conn.close()
     logger.info(f"✅ База данных инициализирована: {DB_PATH}")
 
+    # Пробуем восстановить из бэкапа если БД пуста
+    restored = restore_from_backup()
+    if restored:
+        logger.info("♻️ Данные восстановлены из JSON-бэкапа")
+
 
 def get_user(user_id: int):
     """Возвращает пользователя или None."""
@@ -111,6 +116,7 @@ def start_trial(user_id: int) -> bool:
         )
         conn.commit()
         conn.close()
+        save_backup()  # 💾 бэкап после изменения
         return True
 
     if user["trial_used"]:
@@ -124,6 +130,7 @@ def start_trial(user_id: int) -> bool:
     )
     conn.commit()
     conn.close()
+    save_backup()  # 💾 бэкап после изменения
     return True
 
 
@@ -228,6 +235,7 @@ def activate_sub(user_id: int, plan: str, admin_id: int = None):
 
     conn.commit()
     conn.close()
+    save_backup()  # 💾 бэкап после изменения
     logger.info(f"💳 Активирована подписка {plan} для user_id={user_id}")
     return True
 
@@ -249,3 +257,113 @@ def get_stats() -> dict:
     revenue = conn.execute("SELECT COALESCE(SUM(amount), 0) FROM purchases").fetchone()[0]
     conn.close()
     return {"total": total, "active": active, "paid": paid, "revenue": revenue}
+
+
+# ─── JSON Backup / Restore ──────────────────────────────────────────────
+# Бэкап в JSON-файл в data/cache/. Переживает restart, но НЕ re-deploy.
+# Перед деплоем админ делает /export в боте.
+
+BACKUP_FILE = os.path.join(DATA_DIR, "cache", "db-backup.json")
+
+
+def export_db_to_json() -> dict:
+    """Экспортирует всю БД в JSON (для бэкапа)."""
+    conn = get_conn()
+    users = conn.execute("SELECT * FROM users").fetchall()
+    purchases = conn.execute("SELECT * FROM purchases").fetchall()
+    conn.close()
+    return {
+        "version": 1,
+        "exported_at": int(time.time()),
+        "users": [dict(u) for u in users],
+        "purchases": [dict(p) for p in purchases],
+    }
+
+
+def save_backup():
+    """Сохраняет бэкап в JSON-файл в cache/."""
+    try:
+        data = export_db_to_json()
+        os.makedirs(os.path.dirname(BACKUP_FILE), exist_ok=True)
+        with open(BACKUP_FILE, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+        logger.info(f"💾 Бэкап БД сохранён ({len(data['users'])} users)")
+    except Exception as e:
+        logger.warning(f"Ошибка сохранения бэкапа: {e}")
+
+
+def load_backup() -> dict:
+    """Загружает бэкап из JSON-файла."""
+    if not os.path.isfile(BACKUP_FILE):
+        return {}
+    try:
+        with open(BACKUP_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"Ошибка загрузки бэкапа: {e}")
+        return {}
+
+
+def restore_db_from_dict(backup: dict) -> bool:
+    """
+    Восстанавливает БД из dict (JSON).
+    Возвращает True если восстановление выполнено.
+    """
+    if not backup or "users" not in backup:
+        return False
+
+    conn = get_conn()
+
+    try:
+        # Очищаем текущие данные
+        conn.execute("DELETE FROM purchases")
+        conn.execute("DELETE FROM users")
+
+        # Восстанавливаем пользователей
+        for u in backup["users"]:
+            conn.execute(
+                """INSERT INTO users 
+                   (user_id, username, first_name, trial_start, trial_used, sub_type, sub_start, sub_end, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (u["user_id"], u.get("username", ""), u.get("first_name", ""),
+                 u.get("trial_start"), u.get("trial_used", 0),
+                 u.get("sub_type"), u.get("sub_start"), u.get("sub_end"),
+                 u.get("created_at", int(time.time())), int(time.time()))
+            )
+
+        # Восстанавливаем покупки
+        for p in backup.get("purchases", []):
+            conn.execute(
+                """INSERT INTO purchases (id, user_id, plan, amount, currency, method, admin_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (p["id"], p["user_id"], p["plan"], p["amount"],
+                 p.get("currency", "USD"), p.get("method", "manual"),
+                 p.get("admin_id"), p.get("created_at", int(time.time())))
+            )
+
+        conn.commit()
+        conn.close()
+        save_backup()  # Обновляем JSON-бэкап
+        logger.info(f"✅ БД восстановлена ({len(backup['users'])} users)")
+        return True
+    except Exception as e:
+        conn.close()
+        logger.error(f"Ошибка восстановления БД: {e}")
+        return False
+
+
+def restore_from_backup() -> bool:
+    """
+    Восстанавливает БД из JSON-бэкапа в cache/, если SQLite БД пуста.
+    """
+    backup = load_backup()
+    if not backup or "users" not in backup:
+        return False
+
+    conn = get_conn()
+    existing = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    conn.close()
+    if existing > 0:
+        return False  # БД не пуста — не восстанавливаем
+
+    return restore_db_from_dict(backup)
