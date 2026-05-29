@@ -310,6 +310,7 @@ def clear_user_cache(user_id: str) -> bool:
 def format_singbox(configs: list, user_id: str) -> dict:
     """
     Формат Sing-box JSON (Happ, Hiddify, Sing-box, Streisand, Nekoray).
+    Используется современный формат с peers (совместим с sing-box >= 1.8).
     """
     outbounds = []
     for cfg in configs:
@@ -322,12 +323,18 @@ def format_singbox(configs: list, user_id: str) -> dict:
 
         outbounds.append({
             "type": "wireguard",
-            "tag": f"{BRAND} {cfg['flag']} {cfg['name']}",
+            "tag": f"{cfg['flag']} {cfg['name']}",
             "server": server_host,
             "server_port": server_port,
             "local_address": [f"{cfg['v4']}/32", f"{cfg['v6']}/128"],
             "private_key": cfg["private_key"],
-            "peer_public_key": cfg["public_key"],
+            "peers": [{
+                "server": server_host,
+                "server_port": server_port,
+                "public_key": cfg["public_key"],
+                "allowed_ips": ["0.0.0.0/0", "::/0"],
+                "persistent_keepalive_interval": 25,
+            }],
             "reserved": reserved,
             "mtu": 1280,
         })
@@ -337,62 +344,68 @@ def format_singbox(configs: list, user_id: str) -> dict:
     }
 
 
-def format_clash(configs: list, user_id: str) -> dict:
+def format_clash(configs: list, user_id: str) -> str:
     """
-    Формат Clash Meta (Happ, v2rayTun, Clash Meta).
+    Формат Clash Meta YAML (Happ, v2rayTun, Clash Meta).
+    Возвращает строку в YAML.
     """
-    proxies = []
+    lines = []
+    lines.append("port: 7890")
+    lines.append("socks-port: 7891")
+    lines.append("allow-lan: false")
+    lines.append("mode: Rule")
+    lines.append("log-level: warning")
+    lines.append("")
+
+    # Прокси
+    lines.append("proxies:")
     proxy_names = []
     for cfg in configs:
         server_host = cfg["endpoint"].rsplit(":", 1)[0]
         server_port = int(cfg["endpoint"].rsplit(":", 1)[1])
         try:
-            reserved = json.loads(cfg.get("reserved", "[0,0,0]").replace("'", '"'))
+            reserved_list = json.loads(cfg.get("reserved", "[0,0,0]").replace("'", '"'))
         except:
-            reserved = [0, 0, 0]
+            reserved_list = [0, 0, 0]
 
         name = f"{cfg['flag']} {cfg['name']}"
         proxy_names.append(name)
 
-        proxies.append({
-            "name": name,
-            "type": "WireGuard",
-            "server": server_host,
-            "port": server_port,
-            "ip": cfg["v4"],
-            "ipv6": cfg["v6"],
-            "private-key": cfg["private_key"],
-            "public-key": cfg["public_key"],
-            "reserved": ",".join(str(r) for r in reserved),
-            "udp": True,
-            "mtu": 1280,
-        })
+        lines.append(f"  - name: \"{name}\"")
+        lines.append(f"    type: WireGuard")
+        lines.append(f"    server: {server_host}")
+        lines.append(f"    port: {server_port}")
+        lines.append(f"    ip: {cfg['v4']}")
+        lines.append(f"    ipv6: {cfg['v6']}")
+        lines.append(f"    private-key: {cfg['private_key']}")
+        lines.append(f"    public-key: {cfg['public_key']}")
+        lines.append(f"    reserved: {','.join(str(r) for r in reserved_list)}")
+        lines.append(f"    udp: true")
+        lines.append(f"    mtu: 1280")
+        lines.append("")
 
-    return {
-        "port": 7890,
-        "socks-port": 7891,
-        "allow-lan": False,
-        "mode": "Rule",
-        "log-level": "warning",
-        "proxies": proxies,
-        "proxy-groups": [
-            {
-                "name": "Proxy",
-                "type": "select",
-                "proxies": ["🔀 Авто"] + proxy_names,
-            },
-            {
-                "name": "🔀 Авто",
-                "type": "url-test",
-                "proxies": proxy_names,
-                "url": "http://www.gstatic.com/generate_204",
-                "interval": 300,
-            },
-        ],
-        "rules": [
-            "MATCH,Proxy",
-        ],
-    }
+    lines.append("proxy-groups:")
+    lines.append("  - name: Proxy")
+    lines.append("    type: select")
+    lines.append("    proxies:")
+    lines.append(f"      - \"\U0001f500 \u0410\u0432\u0442\u043e\"")
+    for n in proxy_names:
+        lines.append(f"      - \"{n}\"")
+    lines.append("")
+    lines.append("  - name: \"\U0001f500 \u0410\u0432\u0442\u043e\"")
+    lines.append("    type: url-test")
+    lines.append("    proxies:")
+    for n in proxy_names:
+        lines.append(f"      - \"{n}\"")
+    lines.append("    url: http://www.gstatic.com/generate_204")
+    lines.append("    interval: 300")
+    lines.append("")
+
+    lines.append("rules:")
+    lines.append("  - MATCH,Proxy")
+    lines.append("")
+
+    return "\n".join(lines)
 
 
 def format_wg_conf_all(configs: list, user_id: str) -> str:
@@ -573,11 +586,12 @@ def get_subscription(user_id: str):
         resp = app.response_class(
             response=json.dumps(sub, indent=2, ensure_ascii=False),
             status=200,
-            mimetype="application/json",
+            mimetype="text/plain",
         )
         resp.headers["Subscription-Userinfo"] = "upload=0; download=0; total=1099511627776; expire=0"
         resp.headers["Profile-Title"] = BRAND
         resp.headers["Profile-Update-Interval"] = "24"
+        resp.headers["Content-Disposition"] = "attachment; filename=\"desacratio-singbox.json\""
         resp.headers["Access-Control-Allow-Origin"] = "*"
 
         logger.info(f"📤 Sing-box subscription for {user_id}: {len(configs)} servers")
@@ -591,22 +605,23 @@ def get_subscription(user_id: str):
 @rate_limit
 @require_subscription
 def get_clash_subscription(user_id: str):
-    """Clash-подписка для Happ/v2rayTun."""
+    """Clash-подписка YAML для Happ/v2rayTun."""
     try:
         configs = get_cached_configs(user_id)
-        sub = format_clash(configs, user_id)
+        yaml_str = format_clash(configs, user_id)
 
         resp = app.response_class(
-            response=json.dumps(sub, indent=2, ensure_ascii=False),
+            response=yaml_str,
             status=200,
-            mimetype="application/json",
+            mimetype="text/plain",
         )
         resp.headers["Subscription-Userinfo"] = "upload=0; download=0; total=1099511627776; expire=0"
         resp.headers["Profile-Title"] = BRAND
         resp.headers["Profile-Update-Interval"] = "24"
+        resp.headers["Content-Disposition"] = "attachment; filename=\"desacratio-clash.yaml\""
         resp.headers["Access-Control-Allow-Origin"] = "*"
 
-        logger.info(f"📤 Clash subscription for {user_id}: {len(configs)} servers")
+        logger.info(f"📤 Clash YAML subscription for {user_id}: {len(configs)} servers")
         return resp
     except Exception as e:
         logger.error(f"Clash error for {user_id}: {e}")
