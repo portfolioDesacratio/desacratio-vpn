@@ -994,11 +994,13 @@ def main():
 
     # ⏰ Keep-alive: каждые 5 минут пингуем свой health endpoint
     # чтобы Render не выключал сервис за простой
-    if "localhost" not in PUBLIC_URL and PUBLIC_URL:
+    if "localhost" not in PUBLIC_URL and PUBLIC_URL and bot.job_queue is not None:
         bot.job_queue.run_repeating(keep_alive_job, interval=300, first=60)
         logger.info(f"💓 Keep-alive запущен: каждые 5 мин -> {PUBLIC_URL}/health")
-    else:
+    elif "localhost" in PUBLIC_URL or not PUBLIC_URL:
         logger.info("💤 Keep-alive отключён (нет публичного URL)")
+    else:
+        logger.warning("💤 Keep-alive отключён (job_queue не поддерживается)")
 
     logger.info(f"🚀 {BRAND} Bot запущен!")
     print(f"╔══════════════════════════════════════╗")
