@@ -20,7 +20,7 @@ if [ "${RELAY_ENABLED}" = "true" ]; then
     echo "  ⚠️  CONNECT proxy работает ТОЛЬКО если сервер НЕ за Cloudflare!"
 else
     echo "📡 Запуск WARP API (WireGuard подписки) на порту $PORT..."
-    python3 api/warp-api.py &
+    python3 warp-api.py &
     SERVER_PID=$!
 fi
 
