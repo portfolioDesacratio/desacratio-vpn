@@ -25,13 +25,9 @@ import sys
 import json
 import time
 import random
-import string
 import logging
 import subprocess
-import tempfile
-from pathlib import Path
 from functools import wraps
-from urllib.parse import urlparse
 
 # ─── DB ───────────────────────────────────────────────────────────────────
 try:
@@ -59,7 +55,7 @@ PORT          = int(os.environ.get("PORT", os.environ.get("API_PORT", "8443")))
 
 # Render.com URL для self-reference
 RENDER_URL    = os.environ.get("RENDER_URL", os.environ.get("RENDER_EXTERNAL_URL", "")).rstrip("/")
-WARP_REG_BIN  = os.environ.get("WARP_REG_BIN", os.path.join(os.path.dirname(__file__), "warp-reg"))
+WARP_REG_BIN  = os.environ.get("WARP_REG_BIN", os.path.join(os.path.dirname(__file__), "warp-reg"))  # не используется
 RATE_LIMIT    = int(os.environ.get("RATE_LIMIT", "20"))
 CACHE_TTL     = int(os.environ.get("CACHE_TTL", "86400"))
 SERVERS_CNT   = int(os.environ.get("SERVERS_COUNT", "5"))
@@ -99,244 +95,48 @@ SERVERS = [
      "endpoint": "engage.cloudflareclient.com:2408", "color": "#8B5CF6"},
 ]
 
-# Дополнительные endpoint'ы для ротации, если какой-то не работает
-FALLBACK_ENDPOINTS = [
-    "162.159.193.4:2408",
-    "162.159.193.6:2408",
-    "162.159.193.8:2408",
-    "162.159.193.10:2408",
-]
-
-# ─── Генерация WARP конфигов ─────────────────────────────────────────────
-
-def run_warp_reg(endpoint: str) -> dict:
-    """
-    Запускает warp-reg, парсит вывод, возвращает dict с ключами.
-    """
+# ─── Proxy Scraper ─────────────────────────────────────────────────────────
+try:
+    from api.proxy_scraper import get_proxies, init_proxy_scraper
+except ImportError:
     try:
-        result = subprocess.run(
-            [WARP_REG_BIN],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(f"❌ warp-reg не найден: {WARP_REG_BIN}")
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("⏰ warp-reg превысил таймаут (30с)")
-
-    if result.returncode != 0:
-        raise RuntimeError(f"warp-reg error ({result.returncode}): {result.stderr}")
-
-    config = {}
-    for line in result.stdout.strip().split("\n"):
-        if ":" in line:
-            key, val = line.split(":", 1)
-            config[key.strip()] = val.strip()
-
-    config["endpoint"] = endpoint
-    return config
+        from proxy_scraper import get_proxies, init_proxy_scraper
+    except ImportError:
+        # fallback — no-op
+        def get_proxies(count=5):
+            return [{"flag": "🌍", "name": "Error", "type": "http",
+                     "server": "127.0.0.1", "port": 8080, "country": "XX"}]
+        def init_proxy_scraper(): pass
 
 
-def make_wireguard_config(config: dict) -> str:
+# ─── Получение прокси-конфигов ─────────────────────────────────────────────
+def get_proxy_configs(user_id: str) -> list:
     """
-    Форматирует конфиг warp-reg в стандартный .conf WireGuard.
+    Возвращает прокси для пользователя (по одному из каждой страны).
     """
-    private_key = config.get("private_key", "")
-    peer_pub    = config.get("public_key", "")
-    endpoint    = config.get("endpoint", "engage.cloudflareclient.com:2408")
-    v4          = config.get("v4", "172.16.0.2")
-    v6          = config.get("v6", "2606:4700:110:8a20::1")
-    reserved_raw = config.get("reserved", "[0, 0, 0]")
-
-    try:
-        reserved = json.loads(reserved_raw.replace("'", '"'))
-    except (json.JSONDecodeError, TypeError):
-        reserved = [0, 0, 0]
-
-    reserved_str = ", ".join(str(r) for r in reserved)
-
-    return "\n".join([
-        "[Interface]",
-        f"PrivateKey = {private_key}",
-        f"Address = {v4}/32",
-        f"Address = {v6}/128",
-        "DNS = 1.1.1.1, 1.0.0.1",
-        "MTU = 1280",
-        "",
-        "[Peer]",
-        f"PublicKey = {peer_pub}",
-        "AllowedIPs = 0.0.0.0/0",
-        "AllowedIPs = ::/0",
-        f"Endpoint = {endpoint}",
-        "PersistentKeepalive = 25",
-    ])
+    proxies = get_proxies(count=SERVERS_CNT)
+    if not proxies:
+        raise RuntimeError("💀 Нет доступных прокси!")
+    logger.info(f"🌐 Прокси для {user_id}: {len(proxies)} шт")
+    return proxies
 
 
-def generate_user_configs(user_id: str) -> list:
+# ─── Форматтеры подписок (прокси) ──────────────────────────────────────────
+
+def format_singbox(proxy_configs: list, user_id: str) -> dict:
     """
-    Генерирует SERVERS_CNT конфигов для пользователя.
-    Каждый конфиг использует endpoint из SERVERS.
-    Возвращает список dict'ов с полным конфигом.
-    """
-    # Перемешиваем сервера для распределения нагрузки
-    servers = SERVERS.copy()
-    random.shuffle(servers)
-
-    configs = []
-    errors = 0
-
-    for i, srv in enumerate(servers):
-        endpoint = srv["endpoint"]
-        try:
-            raw = run_warp_reg(endpoint)
-            wg = make_wireguard_config(raw)
-
-            configs.append({
-                "id":        srv["id"],
-                "name":      srv["name"],
-                "flag":      srv["flag"],
-                "emoji":     srv["emoji"],
-                "color":     srv["color"],
-                "endpoint":  endpoint,
-                "private_key": raw.get("private_key", ""),
-                "public_key":  raw.get("public_key", ""),
-                "v4":          raw.get("v4", ""),
-                "v6":          raw.get("v6", ""),
-                "reserved":    raw.get("reserved", "[0, 0, 0]"),
-                "device_id":   raw.get("device_id", ""),
-                "wg_config":   wg,
-            })
-            logger.info(f"✅ [{i+1}/{len(servers)}] {srv['flag']} {srv['name']} @ {endpoint}")
-        except Exception as e:
-            logger.warning(f"❌ [{i+1}/{len(servers)}] {srv['flag']} {srv['name']}: {e}")
-            errors += 1
-            # Пробуем fallback endpoint для этого сервера
-            for fb in FALLBACK_ENDPOINTS:
-                try:
-                    raw = run_warp_reg(fb)
-                    wg = make_wireguard_config(raw)
-                    configs.append({
-                        "id":   srv["id"],
-                        "name": srv["name"],
-                        "flag": srv["flag"],
-                        "emoji": srv["emoji"],
-                        "color": srv["color"],
-                        "endpoint": fb,
-                        "private_key": raw.get("private_key", ""),
-                        "public_key":  raw.get("public_key", ""),
-                        "v4":          raw.get("v4", ""),
-                        "v6":          raw.get("v6", ""),
-                        "reserved":    raw.get("reserved", "[0, 0, 0]"),
-                        "device_id":   raw.get("device_id", ""),
-                        "wg_config":   wg,
-                    })
-                    logger.info(f"  ✅ Fallback {fb} works for {srv['name']}")
-                    break
-                except:
-                    continue
-
-        time.sleep(random.uniform(0.3, 0.8))
-
-    if not configs:
-        raise RuntimeError("💀 Не удалось сгенерировать ни одного конфига!")
-
-    logger.info(f"🎯 Сгенерировано {len(configs)} конфигов для {user_id}")
-    return configs
-
-
-# ─── Кеширование ─────────────────────────────────────────────────────────
-
-def get_cache_dir() -> Path:
-    """Создаёт и возвращает директорию для кеша."""
-    d = Path(DATA_DIR) / "cache"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def get_cached_configs(user_id: str) -> list:
-    """
-    Возвращает кешированные конфиги для user_id.
-    Если кеш протух или отсутствует — генерирует новые.
-    """
-    cache_dir = get_cache_dir()
-    cache_file = cache_dir / f"{user_id}.json"
-
-    # Пробуем загрузить
-    if cache_file.exists():
-        try:
-            with open(cache_file, "r") as f:
-                data = json.load(f)
-            if time.time() - data.get("cached_at", 0) < CACHE_TTL:
-                configs = data.get("configs", [])
-                if len(configs) >= 3:
-                    logger.info(f"📦 Cache HIT for {user_id}: {len(configs)} configs")
-                    return configs
-        except Exception as e:
-            logger.warning(f"Cache read failed for {user_id}: {e}")
-
-    # Генерируем новые
-    logger.info(f"🔄 Генерация новых конфигов для {user_id}...")
-    configs = generate_user_configs(user_id)
-
-    # Сохраняем
-    try:
-        cache_data = {
-            "cached_at": time.time(),
-            "user_id":   user_id,
-            "configs":   configs,
-        }
-        with open(cache_file, "w") as f:
-            json.dump(cache_data, f, indent=2, ensure_ascii=False)
-        logger.info(f"💾 Кеш сохранён для {user_id} ({len(configs)} configs)")
-    except Exception as e:
-        logger.warning(f"Cache save failed: {e}")
-
-    return configs
-
-
-def clear_user_cache(user_id: str) -> bool:
-    """Удаляет кеш пользователя. Возвращает True если файл был."""
-    cache_file = get_cache_dir() / f"{user_id}.json"
-    if cache_file.exists():
-        cache_file.unlink()
-        logger.info(f"🗑️  Кеш удалён для {user_id}")
-        return True
-    return False
-
-
-# ─── Форматтеры подписок ─────────────────────────────────────────────────
-
-def format_singbox(configs: list, user_id: str) -> dict:
-    """
-    Формат Sing-box JSON (Happ, Hiddify, Sing-box, Streisand, Nekoray).
-    Используется современный формат с peers (совместим с sing-box >= 1.8).
+    Формат Sing-box JSON с HTTP/SOCKS5 outbound'ами.
     """
     outbounds = []
-    for cfg in configs:
-        server_host = cfg["endpoint"].rsplit(":", 1)[0]
-        server_port = int(cfg["endpoint"].rsplit(":", 1)[1])
-        try:
-            reserved = json.loads(cfg.get("reserved", "[0,0,0]").replace("'", '"'))
-        except:
-            reserved = [0, 0, 0]
+    for i, cfg in enumerate(proxy_configs):
+        tag = f"{cfg['flag']} {cfg['name']}"
+        outbound_type = "http" if cfg["type"] in ("http", "https") else "socks"
 
         outbounds.append({
-            "type": "wireguard",
-            "tag": f"{cfg['flag']} {cfg['name']}",
-            "server": server_host,
-            "server_port": server_port,
-            "local_address": [f"{cfg['v4']}/32", f"{cfg['v6']}/128"],
-            "private_key": cfg["private_key"],
-            "peers": [{
-                "server": server_host,
-                "server_port": server_port,
-                "public_key": cfg["public_key"],
-                "allowed_ips": ["0.0.0.0/0", "::/0"],
-                "persistent_keepalive_interval": 25,
-            }],
-            "reserved": reserved,
-            "mtu": 1280,
+            "type": outbound_type,
+            "tag": tag,
+            "server": cfg["server"],
+            "server_port": int(cfg["port"]),
         })
 
     return {
@@ -344,10 +144,9 @@ def format_singbox(configs: list, user_id: str) -> dict:
     }
 
 
-def format_clash(configs: list, user_id: str) -> str:
+def format_clash(proxy_configs: list, user_id: str) -> str:
     """
-    Формат Clash Meta YAML (Happ, v2rayTun, Clash Meta).
-    Возвращает строку в YAML.
+    Формат Clash Meta YAML с HTTP/SOCKS5 прокси.
     """
     lines = []
     lines.append("port: 7890")
@@ -356,43 +155,26 @@ def format_clash(configs: list, user_id: str) -> str:
     lines.append("mode: Rule")
     lines.append("log-level: warning")
     lines.append("")
-
-    # Прокси
     lines.append("proxies:")
     proxy_names = []
-    for cfg in configs:
-        server_host = cfg["endpoint"].rsplit(":", 1)[0]
-        server_port = int(cfg["endpoint"].rsplit(":", 1)[1])
-        try:
-            reserved_list = json.loads(cfg.get("reserved", "[0,0,0]").replace("'", '"'))
-        except:
-            reserved_list = [0, 0, 0]
-
+    for cfg in proxy_configs:
         name = f"{cfg['flag']} {cfg['name']}"
         proxy_names.append(name)
-
+        proxy_type = "http" if cfg["type"] in ("http", "https") else "socks5"
         lines.append(f"  - name: \"{name}\"")
-        lines.append(f"    type: WireGuard")
-        lines.append(f"    server: {server_host}")
-        lines.append(f"    port: {server_port}")
-        lines.append(f"    ip: {cfg['v4']}")
-        lines.append(f"    ipv6: {cfg['v6']}")
-        lines.append(f"    private-key: {cfg['private_key']}")
-        lines.append(f"    public-key: {cfg['public_key']}")
-        lines.append(f"    reserved: {','.join(str(r) for r in reserved_list)}")
-        lines.append(f"    udp: true")
-        lines.append(f"    mtu: 1280")
+        lines.append(f"    type: {proxy_type}")
+        lines.append(f"    server: {cfg['server']}")
+        lines.append(f"    port: {cfg['port']}")
         lines.append("")
-
     lines.append("proxy-groups:")
     lines.append("  - name: Proxy")
     lines.append("    type: select")
     lines.append("    proxies:")
-    lines.append(f"      - \"\U0001f500 \u0410\u0432\u0442\u043e\"")
+    lines.append("      - \"🔀 Авто\"")
     for n in proxy_names:
         lines.append(f"      - \"{n}\"")
     lines.append("")
-    lines.append("  - name: \"\U0001f500 \u0410\u0432\u0442\u043e\"")
+    lines.append("  - name: \"🔀 Авто\"")
     lines.append("    type: url-test")
     lines.append("    proxies:")
     for n in proxy_names:
@@ -400,60 +182,22 @@ def format_clash(configs: list, user_id: str) -> str:
     lines.append("    url: http://www.gstatic.com/generate_204")
     lines.append("    interval: 300")
     lines.append("")
-
     lines.append("rules:")
     lines.append("  - MATCH,Proxy")
     lines.append("")
-
     return "\n".join(lines)
 
 
-def format_wg_conf_all(configs: list, user_id: str) -> str:
+def format_wg_conf_all(proxy_configs: list, user_id: str) -> str:
     """
-    Один .conf файл со всеми серверами.
-    Каждый сервер — отдельный блок [Interface]+[Peer].
-    Совместимо с: WireGuard, Happ, Sing-box, Clash, OpenVPN (импорт .conf)
+    Справка: WireGuard .conf больше не генерируется (WARP недоступен).
     """
-    api_url = RENDER_URL or f"http://localhost:{PORT}"
-    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-
-    parts = [
-        f"# ==============================================",
-        f"# {BRAND} — WireGuard Configuration",
-        f"# User ID: {user_id}",
-        f"# Generated: {timestamp}",
-        f"# Servers: {len(configs)}",
-        f"# ==============================================",
-        f"#",
-        f"# 📋 ИНСТРУКЦИЯ:",
-        f"# Выбери ОДИН блок [Interface] + [Peer] ниже",
-        f"# и импортируй его в приложение:",
-        f"#",
-        f"#   📱 Happ / HiddifyNext — + → Импорт из буфера",
-        f"#   🔗 Sing-box — Remote URL: {api_url}/api/sub/{user_id}",
-        f"#   ⚡ Clash Meta — Подписки → Добавить",
-        f"#   📄 WireGuard — Открыть .conf файл",
-        f"#",
-        f"# 📢 Канал: {CHANNEL}",
-        f"# 📞 Поддержка: {SUPPORT}",
-        f"# 💳 Купить: {PURCHASE}",
-        f"#",
-        f"# ==============================================",
-        "",
-    ]
-
-    for i, cfg in enumerate(configs):
-        parts.append(f"# ===== {cfg['flag']} {cfg['name']} ({cfg['endpoint']}) =====")
-        parts.append(cfg["wg_config"])
-        parts.append("")
-
-    # В конце добавляем информацию о всех серверах
-    parts.append("# ==============================================")
-    parts.append(f"# {BRAND_LOGO} {BRAND} — 5 серверов по всему миру")
-    parts.append(f"# Подпишись: {CHANNEL}")
-    parts.append("# ==============================================")
-
-    return "\n".join(parts)
+    return (
+        f"# {BRAND}\n"
+        f"# ВНИМАНИЕ: WireGuard/WARP больше не используется.\n"
+        f"# Используй Sing-box или Clash подписку для Happ.\n"
+        f"# User ID: {user_id}\n"
+    )
 
 
 # ─── Subscription Check ──────────────────────────────────────────────────
@@ -534,17 +278,12 @@ def index():
 
 @app.route("/health")
 def health():
-    warp_reg_exists = os.path.isfile(WARP_REG_BIN)
-    cache_dir_ok = get_cache_dir().exists()
     return jsonify({
-        "status":        "ok",
-        "brand":         BRAND,
-        "warp_reg":      "found" if warp_reg_exists else "missing",
-        "cache_dir":     "ok" if cache_dir_ok else "error",
-        "servers":       len(SERVERS),
-        "cached_users":  len(list(get_cache_dir().glob("*.json"))),
-        "uptime":        time.time() - app_start_time,
-        "version":       "2.0",
+        "status":   "ok",
+        "brand":    BRAND,
+        "servers":  SERVERS_CNT,
+        "uptime":   time.time() - app_start_time,
+        "version":  "3.0",
     })
 
 
@@ -578,9 +317,9 @@ def get_sub_status(user_id: str):
 @rate_limit
 @require_subscription
 def get_subscription(user_id: str):
-    """Sing-box подписка (JSON)."""
+    """Sing-box подписка (прокси, JSON)."""
     try:
-        configs = get_cached_configs(user_id)
+        configs = get_proxy_configs(user_id)
         sub = format_singbox(configs, user_id)
 
         resp = app.response_class(
@@ -594,7 +333,7 @@ def get_subscription(user_id: str):
         resp.headers["Content-Disposition"] = "attachment; filename=\"desacratio-singbox.json\""
         resp.headers["Access-Control-Allow-Origin"] = "*"
 
-        logger.info(f"📤 Sing-box subscription for {user_id}: {len(configs)} servers")
+        logger.info(f"📤 Sing-box subscription for {user_id}: {len(configs)} proxies")
         return resp
     except Exception as e:
         logger.error(f"Subscription error for {user_id}: {e}")
@@ -607,7 +346,7 @@ def get_subscription(user_id: str):
 def get_clash_subscription(user_id: str):
     """Clash-подписка YAML для Happ/v2rayTun."""
     try:
-        configs = get_cached_configs(user_id)
+        configs = get_proxy_configs(user_id)
         yaml_str = format_clash(configs, user_id)
 
         resp = app.response_class(
@@ -621,7 +360,7 @@ def get_clash_subscription(user_id: str):
         resp.headers["Content-Disposition"] = "attachment; filename=\"desacratio-clash.yaml\""
         resp.headers["Access-Control-Allow-Origin"] = "*"
 
-        logger.info(f"📤 Clash YAML subscription for {user_id}: {len(configs)} servers")
+        logger.info(f"📤 Clash YAML subscription for {user_id}: {len(configs)} proxies")
         return resp
     except Exception as e:
         logger.error(f"Clash error for {user_id}: {e}")
@@ -632,9 +371,9 @@ def get_clash_subscription(user_id: str):
 @rate_limit
 @require_subscription
 def get_wg_conf(user_id: str):
-    """WireGuard .conf со всеми серверами."""
+    """Информация: WireGuard .conf больше не поддерживается."""
     try:
-        configs = get_cached_configs(user_id)
+        configs = get_proxy_configs(user_id)
         conf = format_wg_conf_all(configs, user_id)
 
         return Response(
@@ -654,19 +393,17 @@ def get_wg_conf(user_id: str):
 @rate_limit
 @require_subscription
 def get_servers_list(user_id: str):
-    """Возвращает список серверов пользователя."""
+    """Возвращает список прокси пользователя."""
     try:
-        configs = get_cached_configs(user_id)
+        configs = get_proxy_configs(user_id)
         servers = []
-        for cfg in configs:
+        for i, cfg in enumerate(configs):
             servers.append({
-                "id":        cfg["id"],
-                "name":      cfg["name"],
-                "flag":      cfg["flag"],
-                "emoji":     cfg["emoji"],
-                "color":     cfg["color"],
-                "endpoint":  cfg["endpoint"],
-                "ip":        cfg["v4"],
+                "id":       cfg.get("country", f"srv{i}"),
+                "name":     cfg["name"],
+                "flag":     cfg["flag"],
+                "type":     cfg["type"],
+                "endpoint": f"{cfg['server']}:{cfg['port']}",
             })
         return jsonify({
             "user":    user_id,
@@ -681,13 +418,15 @@ def get_servers_list(user_id: str):
 @rate_limit
 @require_subscription
 def refresh_subscription(user_id: str):
-    """Принудительно перегенерировать ключи."""
+    """Принудительно обновить список прокси."""
     try:
-        clear_user_cache(user_id)
-        configs = get_cached_configs(user_id)
+        # Принудительно обновляем кеш прокси
+        from api.proxy_scraper import refresh_cache
+        refresh_cache(force=True)
+        configs = get_proxy_configs(user_id)
         return jsonify({
             "success": True,
-            "message": f"🆕 Сгенерировано {len(configs)} новых серверов",
+            "message": f"🆕 Обновлено {len(configs)} прокси",
             "servers": len(configs),
         })
     except Exception as e:
@@ -700,22 +439,19 @@ app_start_time = time.time()
 if __name__ == "__main__":
     # Инициализируем БД
     init_db()
+    # Инициализируем сборщик прокси
+    init_proxy_scraper()
 
     logger.info(f"╔══════════════════════════════════════════╗")
-    logger.info(f"║  {BRAND} API Server v2.0")
+    logger.info(f"║  {BRAND} API Server v3.0")
     logger.info(f"║  Author: {AUTHOR}")
     logger.info(f"║  Channel: {CHANNEL}")
     logger.info(f"║  Support: {SUPPORT}")
     logger.info(f"╚══════════════════════════════════════════╝")
     logger.info(f"  Host: {HOST}:{PORT}")
     logger.info(f"  Render URL: {RENDER_URL or '(не задан)'}")
-    logger.info(f"  warp-reg: {WARP_REG_BIN}")
-    logger.info(f"  Servers per user: {SERVERS_CNT}")
-    logger.info(f"  Cache TTL: {CACHE_TTL // 3600}ч")
+    logger.info(f"  Прокси на пользователя: {SERVERS_CNT}")
     logger.info(f"  Rate limit: {RATE_LIMIT} req/min")
     logger.info(f"  Data dir: {DATA_DIR}")
-
-    if not os.path.isfile(WARP_REG_BIN):
-        logger.warning(f"  ⚠️  warp-reg не найден: {WARP_REG_BIN}")
 
     app.run(host=HOST, port=PORT, debug=False)

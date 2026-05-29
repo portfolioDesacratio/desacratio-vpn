@@ -1,6 +1,6 @@
 # ─── Desacratio VPN — Main Dockerfile ───────────────────────────────────
 # Деплой:   Render.com (Web Service)
-# Содержит API (warp-api.py) + Telegram бота (free-bot.py).
+# Содержит API (warp-api.py + proxy_scraper.py) + Telegram бота (free-bot.py).
 # Запускаются через start.sh.
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -19,8 +19,7 @@ COPY db.py ./
 # ─── API ────────────────────────────────────────────────────────────────
 COPY api/requirements.txt ./requirements-api.txt
 COPY api/warp-api.py ./
-COPY api/warp-reg ./
-RUN chmod +x warp-reg
+COPY api/proxy_scraper.py ./api/
 
 # ─── Bot ────────────────────────────────────────────────────────────────
 COPY bot/requirements.txt ./requirements-bot.txt
