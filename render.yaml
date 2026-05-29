@@ -15,7 +15,7 @@ services:
     name: desacratio-vpn
     env: docker
     dockerfilePath: ./Dockerfile
-    repo: https://github.com/kall1shnik0vv/desacratio-vpn
+    repo: https://github.com/portfolioDesacratio/desacratio-vpn
     branch: main
     plan: free
 
