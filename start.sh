@@ -1,6 +1,6 @@
 #!/bin/bash
 # ─── Desacratio VPN — Startup Script ────────────────────────────────────
-# Запускает API (фон) и Telegram бота (передний план) в одном контейнере.
+# Запускает Relay Proxy (встроенный HTTP CONNECT + API) и Telegram бота.
 # ──────────────────────────────────────────────────────────────────────────
 
 echo "╔══════════════════════════════════════╗"
@@ -8,12 +8,12 @@ echo "║     🛡️ Desacratio VPN — Startup      ║"
 echo "╚══════════════════════════════════════╝"
 
 PORT="${PORT:-8443}"
-echo "📡 Запуск API на порту $PORT..."
-python3 warp-api.py &
-API_PID=$!
+echo "📡 Запуск Relay Proxy (HTTP CONNECT + API) на порту $PORT..."
+python3 api/relay_proxy.py &
+RELAY_PID=$!
 
 # Даём API время на запуск
-sleep 2
+sleep 3
 
 echo "🤖 Запуск Telegram бота..."
 # Bot на переднем плане — контейнер жив, пока жив бот

@@ -16,9 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ─── Shared DB ──────────────────────────────────────────────────────────
 COPY db.py ./
 
-# ─── API ────────────────────────────────────────────────────────────────
+# ─── API + Relay Proxy ─────────────────────────────────────────────────
 COPY api/requirements.txt ./requirements-api.txt
 COPY api/warp-api.py ./
+COPY api/warp_api_wrapper.py ./api/
+COPY api/relay_proxy.py ./api/
 COPY api/proxy_scraper.py ./api/
 
 # ─── Bot ────────────────────────────────────────────────────────────────

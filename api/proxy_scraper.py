@@ -14,6 +14,7 @@ import time
 import random
 import logging
 import socket
+import struct
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.request import urlopen, Request
@@ -36,9 +37,12 @@ DATA_DIR = os.environ.get(
     os.path.join(os.path.dirname(__file__), "data"),
 )
 CACHE_FILE = os.path.join(DATA_DIR, "cache", "proxies.json")
-CACHE_TTL = 600  # 10 минут
-FETCH_TIMEOUT = 5  # таймаут загрузки URL (сек)
-VALIDATION_TIMEOUT = 3  # таймаут TCP-проверки
+CACHE_TTL = 300  # 5 минут (частая перепроверка — прокси умирают быстро)
+FETCH_TIMEOUT = 3  # таймаут загрузки URL (сек) — быстро отваливаемся от мёртвых источников
+VALIDATION_TIMEOUT = 3   # таймаут проверки одного прокси (сек)
+VALIDATION_WORKERS = 40  # параллельных проверок
+VALIDATION_TARGET = "httpbin.org"  # цель для тестового запроса
+MAX_PER_COUNTRY = 50      # сколько прокси проверяем на страну
 
 # ─── Источники прокси ──────────────────────────────────────────────────────
 SOURCES = [
@@ -47,7 +51,7 @@ SOURCES = [
         "url": "https://raw.githubusercontent.com/monosans/proxy-scraper/main/proxies.json",
         "format": "monosans",
     },
-    # Списки IP:PORT
+    # Списки IP:PORT — большое количество
     {
         "url": "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=5000&country=all",
         "format": "plain",
@@ -73,15 +77,30 @@ SOURCES = [
         "format": "plain",
         "default_type": "socks5",
     },
+    {
+        "url": "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+        "format": "plain",
+        "default_type": "socks5",
+    },
+    {
+        "url": "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+        "format": "plain",
+        "default_type": "socks5",
+    },
+    {
+        "url": "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
+        "format": "plain",
+        "default_type": "socks5",
+    },
 ]
 
-# Per-country списки
+# Per-country списки (только подтверждённо работающие источники)
 COUNTRY_PROXY_SOURCES = []
 for cc in TARGET_COUNTRIES:
-    COUNTRY_PROXY_SOURCES += [
-        f"https://www.proxy-list.download/api/v1/get?type=http&country={cc}",
-        f"https://www.proxy-list.download/api/v1/get?type=socks5&country={cc}",
-    ]
+    for proto in ["http", "socks5"]:
+        COUNTRY_PROXY_SOURCES.append(
+            f"https://api.proxyscrape.com/v2/?request=getproxies&protocol={proto}&timeout=10000&country={cc}"
+        )
 
 # Локальный кеш (thread-safe)
 _cache_lock = threading.Lock()
@@ -155,46 +174,130 @@ def resolve_country(ip: str) -> str | None:
     """GeoIP через ip-api.com (бесплатно, 45 запросов/мин)."""
     try:
         url = f"http://ip-api.com/json/{ip}?fields=countryCode"
-        with urlopen(url, timeout=3) as resp:
+        with urlopen(url, timeout=2) as resp:
             data = json.loads(resp.read())
             return data.get("countryCode")
     except Exception:
         return None
 
 
-def validate_proxy(host: str, port: int, timeout: int = 3) -> bool:
-    """Проверяет, работает ли прокси (HTTP CONNECT или SOCKS5)."""
+def test_socks5(host: str, port: int, timeout: int = 5) -> bool:
+    """Реальная проверка SOCKS5: CONNECT + HTTP GET через прокси.
+
+    Использует setdefaulttimeout для гарантированного таймаута.
+    """
+    socket.setdefaulttimeout(timeout)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
-        result = s.connect_ex((host, port))
-        if result != 0:
+        s.connect((host, port))
+
+        # SOCKS5 handshake
+        s.send(b'\x05\x01\x00')
+        resp = s.recv(2)
+        if resp != b'\x05\x00':
             s.close()
             return False
 
-        # Пробуем SOCKS5 handshake
-        try:
-            s.send(b'\x05\x01\x00')
-            resp = s.recv(2)
-            if resp == b'\x05\x00':
-                s.close()
-                return True  # SOCKS5 работает
-        except:
-            pass
+        # SOCKS5 CONNECT к реальному хосту
+        target_host = VALIDATION_TARGET.encode()
+        target_port = 80
+        msg = b'\x05\x01\x00\x03' + bytes([len(target_host)]) + target_host + struct.pack('>H', target_port)
+        s.send(msg)
 
-        # Пробуем HTTP CONNECT
-        try:
-            s.send(b'CONNECT httpbin.org:80 HTTP/1.1\r\nHost: httpbin.org\r\n\r\n')
-            resp = s.recv(4096)
-            s.close()
-            if b'200' in resp or b'OK' in resp:
-                return True  # HTTP CONNECT работает
-            return False  # HTTP есть но CONNECT не поддерживает
-        except:
+        # Ответ: байт 1 = 0 означает успех
+        resp = s.recv(4)
+        if len(resp) < 2 or resp[1] != 0:
             s.close()
             return False
+
+        # Туннель установлен — отправляем HTTP-запрос через него
+        http_req = (
+            b'GET /ip HTTP/1.1\r\n'
+            b'Host: ' + target_host + b'\r\n'
+            b'User-Agent: curl/8.0\r\n'
+            b'Connection: close\r\n\r\n'
+        )
+        s.send(http_req)
+
+        # Читаем первые 512 байт (достаточно для заголовков)
+        data = s.recv(512)
+        s.close()
+
+        return b'HTTP/' in data
+
     except Exception:
         return False
+    finally:
+        socket.setdefaulttimeout(None)
+
+
+def test_http_connect(host: str, port: int, timeout: int = 5) -> bool:
+    """Реальная проверка HTTP CONNECT прокси."""
+    socket.setdefaulttimeout(timeout)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+
+        # CONNECT к целевому хосту
+        target_host = VALIDATION_TARGET.encode()
+        s.send(b'CONNECT ' + target_host + b':80 HTTP/1.1\r\nHost: ' + target_host + b'\r\n\r\n')
+
+        resp = s.recv(4096)
+        if b'200' not in resp and b'OK' not in resp:
+            s.close()
+            return False
+
+        # CONNECT успешен — теперь отправляем HTTP-запрос через туннель
+        http_req = (
+            b'GET /ip HTTP/1.1\r\n'
+            b'Host: ' + target_host + b'\r\n'
+            b'Connection: close\r\n\r\n'
+        )
+        s.send(http_req)
+
+        data = s.recv(512)
+        s.close()
+
+        return b'HTTP/' in data
+
+    except Exception:
+        return False
+    finally:
+        socket.setdefaulttimeout(None)
+
+
+SOCK5_PORTS = {1080, 1081, 1082, 9050, 9150, 10800, 4145, 10800}
+HTTP_PORTS  = {80, 443, 8080, 3128, 8888, 8889, 9090, 8081, 8443}
+
+
+def validate_proxy_real(host: str, port: int, timeout: int = 3) -> tuple:
+    """Проверяет прокси: возвращает (тип, True/False).
+
+    Сначала пробует SOCKS5 (+ реальный CONNECT к httpbin), затем HTTP CONNECT.
+    На неизвестных портах пробует только SOCKS5 (экономит время).
+    """
+    # Известные SOCKS5 порты
+    if port in SOCK5_PORTS:
+        ok = test_socks5(host, port, timeout)
+        if ok:
+            return ("socks5", True)
+        return (None, False)
+
+    # Известные HTTP порты
+    if port in HTTP_PORTS:
+        ok = test_http_connect(host, port, timeout)
+        if ok:
+            return ("http", True)
+        return (None, False)
+
+    # Неизвестный порт — пробуем SOCKS5
+    ok = test_socks5(host, port, timeout)
+    if ok:
+        return ("socks5", True)
+
+    return (None, False)
 
 
 # ─── Основные функции ──────────────────────────────────────────────────────
@@ -258,7 +361,7 @@ def deduplicate(proxies: list) -> list:
     return unique
 
 
-def assign_countries(proxies: list, max_lookups: int = 45) -> list:
+def assign_countries(proxies: list, max_lookups: int = 20) -> list:
     """Определяет страну для прокси без country через GeoIP (лимит ip-api)."""
     unresolved = [p for p in proxies if not p.get("country")]
     logger.info(f"  GeoIP: {len(unresolved)} без страны, проверим {min(max_lookups, len(unresolved))}...")
@@ -277,48 +380,78 @@ def assign_countries(proxies: list, max_lookups: int = 45) -> list:
     return proxies
 
 
-def validate_batch(proxies: list, max_per_country: int = 15) -> list:
-    """Проверяет живые прокси — по N на страну. Обновляет тип по результатам проверки."""
+SOCKS_VALIDATION_TIMEOUT = 3  # сколько ждать SOCKS5 CONNECT + HTTP GET
+
+
+def validate_global(proxies: list) -> list:
+    """Глобальная параллельная проверка прокси реальным трафиком.
+
+    Берём большую выборку (500), TCP префильтр (1s), затем реальный SOCKS5 тест.
+    """
+    if not proxies:
+        return []
+
+    # Берём 500 случайных прокси (достаточно для нахождения 10+ живых)
+    sample_size = min(500, len(proxies))
+    candidates = random.sample(proxies, sample_size)
+
+    # Stage 1: TCP prefilter (1s timeout, 50 workers)
+    tcp_alive = []
+    with ThreadPoolExecutor(max_workers=50) as pool:
+        def tcp_check(p):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1)
+                r = s.connect_ex((p["host"], p["port"]))
+                s.close()
+                return r == 0
+            except:
+                return False
+
+        fut_map = {pool.submit(tcp_check, p): p for p in candidates}
+        for fut in as_completed(fut_map, timeout=20):
+            p = fut_map[fut]
+            try:
+                if fut.result():
+                    tcp_alive.append(p)
+            except:
+                pass
+
+    logger.info(f"  TCP prefilter: {len(tcp_alive)}/{sample_size} живы (по TCP)")
+    if not tcp_alive:
+        logger.warning("  Нет живых по TCP! Возможно, сетевые проблемы.")
+        return []
+
+    # Stage 2: Real SOCKS5/HTTP test
+    logger.info(f"  SOCKS5 тест: {len(tcp_alive)} кандидатов...")
     valid = []
-    by_country: dict = {}
-    for p in proxies:
-        cc = p.get("country")
-        if cc in TARGET_COUNTRIES:
-            by_country.setdefault(cc, []).append(p)
+    with ThreadPoolExecutor(max_workers=VALIDATION_WORKERS) as pool:
+        fut_to_proxy = {}
+        for p in tcp_alive:
+            fut = pool.submit(
+                validate_proxy_real,
+                p["host"], p["port"],
+                SOCKS_VALIDATION_TIMEOUT,
+            )
+            fut_to_proxy[fut] = p
 
-    for cc, plist in by_country.items():
-        random.shuffle(plist)
-        tested = 0
-        alive = 0
-        for p in plist[:max_per_country]:
-            ok = validate_proxy(p["host"], p["port"], VALIDATION_TIMEOUT)
-            tested += 1
-            if ok:
-                alive += 1
-                # Определяем реальный тип по результатам валидации
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(2)
-                    s.connect((p["host"], p["port"]))
-                    s.send(b'\x05\x01\x00')
-                    resp = s.recv(2)
-                    s.close()
-                    if resp == b'\x05\x00':
-                        p["type"] = "socks5"
-                    else:
-                        p["type"] = "http"
-                except:
-                    p["type"] = p.get("type", "http")
-                valid.append(p)
-        logger.info(f"  {cc}: {tested} проверено, {alive} живых")
+        for fut in as_completed(fut_to_proxy, timeout=SOCKS_VALIDATION_TIMEOUT + 15):
+            p = fut_to_proxy[fut]
+            try:
+                detected_type, ok = fut.result()
+                if ok:
+                    p["type"] = detected_type
+                    valid.append(p)
+            except Exception:
+                pass
 
-    # Сортируем: SOCKS5 вперёд, HTTP назад
     valid.sort(key=lambda x: (0 if x["type"] == "socks5" else 1, random.random()))
+    logger.info(f"  Живых (реальный трафик): {len(valid)}/{len(tcp_alive)}")
     return valid
 
 
 def refresh_cache(force: bool = False) -> list:
-    """Обновляет кеш прокси с общим таймаутом 60 секунд."""
+    """Обновляет кеш прокси: сбор → дедуп → валидация → GeoIP → страны."""
     global _cache, _last_refresh_time
     now = time.time()
 
@@ -327,36 +460,48 @@ def refresh_cache(force: bool = False) -> list:
             return _cache["proxies"]
 
     logger.info("🌐 Обновление списка прокси...")
-    deadline = time.time() + 60  # общий таймаут 60с
+    deadline = time.time() + 120  # общий таймаут 120с
     valid = []
 
     try:
+        # 1. Сбор из всех источников
         raw = collect_all()
         logger.info(f"  Собрано: {len(raw)} прокси")
+        if time.time() > deadline:
+            raise TimeoutError("Превышено время сбора")
+
+        # 2. Дедупликация
         raw = deduplicate(raw)
         logger.info(f"  После дедупликации: {len(raw)}")
-
         if time.time() > deadline:
-            raise TimeoutError("Превышено время сбора прокси")
+            raise TimeoutError("Превышено время дедупликации")
 
-        raw = assign_countries(raw)
-        if time.time() > deadline:
-            raise TimeoutError("Превышено время GeoIP")
+        # 3. Валидация реальным трафиком (без GeoIP — сначала проверяем)
+        valid = validate_global(raw)
+        if not valid:
+            logger.warning("  Ни одного живого прокси не найдено!")
+        else:
+            # 4. GeoIP только для живых прокси
+            valid = assign_countries(valid, max_lookups=45)
+            logger.info(f"  После GeoIP: {len([p for p in valid if p.get('country')])} со страной")
 
-        valid = validate_batch(raw)
         if time.time() > deadline:
             raise TimeoutError("Превышено время валидации")
 
-        # Если после всей валидации ничего не осталось — используем невалидированные
-        if not valid:
-            logger.warning("  Все прокси умерли! Используем невалидированные...")
-            by_country = {}
-            for p in raw:
-                cc = p.get("country")
-                if cc in TARGET_COUNTRIES:
-                    by_country.setdefault(cc, []).append(p)
-            for cc, plist in by_country.items():
-                valid.extend(plist[:5])
+        # Если всё равно нет прокси со странами — пытаемся ещё через GeoIP
+        has_country = [p for p in valid if p.get("country") in TARGET_COUNTRIES]
+        if not has_country and valid:
+            logger.warning("  Нет прокси с целевыми странами! Повторное GeoIP...")
+            valid = assign_countries(valid, max_lookups=45)
+
+        # Финал: оставляем только с целевыми странами
+        final = [p for p in valid if p.get("country") in TARGET_COUNTRIES]
+        if not final and valid:
+            # Если совсем нет — возвращаем все живые с любыми странами
+            logger.warning("  Используем живые прокси без фильтра по стране")
+            final = valid[:5]
+
+        valid = final
 
         with _cache_lock:
             _cache = {"proxies": valid, "timestamp": now}
@@ -367,7 +512,7 @@ def refresh_cache(force: bool = False) -> list:
         with open(CACHE_FILE, "w") as f:
             json.dump({"timestamp": now, "proxies": valid}, f)
 
-        logger.info(f"✅ Кеш прокси обновлён: {len(valid)} живых")
+        logger.info(f"✅ Кеш прокси обновлён: {len(valid)} рабочих")
     except Exception as e:
         logger.error(f"Ошибка обновления прокси: {e}")
         # Возвращаем старые из кеша/файла

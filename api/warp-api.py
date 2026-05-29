@@ -95,30 +95,38 @@ SERVERS = [
      "endpoint": "engage.cloudflareclient.com:2408", "color": "#8B5CF6"},
 ]
 
-# ─── Proxy Scraper ─────────────────────────────────────────────────────────
-try:
-    from api.proxy_scraper import get_proxies, init_proxy_scraper
-except ImportError:
-    try:
-        from proxy_scraper import get_proxies, init_proxy_scraper
-    except ImportError:
-        # fallback — no-op
-        def get_proxies(count=5):
-            return [{"flag": "🌍", "name": "Error", "type": "http",
-                     "server": "127.0.0.1", "port": 8080, "country": "XX"}]
-        def init_proxy_scraper(): pass
+# ─── Relay Proxy (встроенный HTTP CONNECT) ──────────────────────────────
+RELAY_DOMAIN = os.environ.get(
+    "RELAY_DOMAIN",
+    (RENDER_URL or "desacratio-vpn.onrender.com").replace("https://", "").rstrip("/"),
+)
+
+RELAY_COUNTRIES = [
+    {"id": "pl", "name": "Poland",     "flag": "🇵🇱"},
+    {"id": "de", "name": "Germany",    "flag": "🇩🇪"},
+    {"id": "nl", "name": "Netherlands","flag": "🇳🇱"},
+    {"id": "gb", "name": "UK",         "flag": "🇬🇧"},
+    {"id": "us", "name": "USA",        "flag": "🇺🇸"},
+]
 
 
-# ─── Получение прокси-конфигов ─────────────────────────────────────────────
 def get_proxy_configs(user_id: str) -> list:
     """
-    Возвращает прокси для пользователя (по одному из каждой страны).
+    Возвращает 5 релей-прокси (HTTP CONNECT через наш сервер).
     """
-    proxies = get_proxies(count=SERVERS_CNT)
-    if not proxies:
-        raise RuntimeError("💀 Нет доступных прокси!")
-    logger.info(f"🌐 Прокси для {user_id}: {len(proxies)} шт")
-    return proxies
+    configs = []
+    for i, country in enumerate(RELAY_COUNTRIES):
+        configs.append({
+            "flag": country["flag"],
+            "name": country["name"],
+            "type": "http",
+            "server": RELAY_DOMAIN,
+            "port": 443,
+            "tls": True,
+            "country": country["id"].upper(),
+        })
+    logger.info(f"🔌 Relay proxy configs для {user_id}: {len(configs)} шт (domain={RELAY_DOMAIN})")
+    return configs
 
 
 # ─── Форматтеры подписок (прокси) ──────────────────────────────────────────
@@ -132,12 +140,18 @@ def format_singbox(proxy_configs: list, user_id: str) -> dict:
         tag = f"{cfg['flag']} {cfg['name']}"
         outbound_type = "http" if cfg["type"] in ("http", "https") else "socks"
 
-        outbounds.append({
+        outbound = {
             "type": outbound_type,
             "tag": tag,
             "server": cfg["server"],
             "server_port": int(cfg["port"]),
-        })
+        }
+
+        # TLS для HTTP CONNECT через HTTPS
+        if cfg.get("tls") and outbound_type == "http":
+            outbound["tls"] = {}
+
+        outbounds.append(outbound)
 
     return {
         "outbounds": outbounds,
@@ -165,6 +179,8 @@ def format_clash(proxy_configs: list, user_id: str) -> str:
         lines.append(f"    type: {proxy_type}")
         lines.append(f"    server: {cfg['server']}")
         lines.append(f"    port: {cfg['port']}")
+        if cfg.get("tls") and proxy_type == "http":
+            lines.append("    tls: true")
         lines.append("")
     lines.append("proxy-groups:")
     lines.append("  - name: Proxy")
@@ -418,15 +434,12 @@ def get_servers_list(user_id: str):
 @rate_limit
 @require_subscription
 def refresh_subscription(user_id: str):
-    """Принудительно обновить список прокси."""
+    """Принудительно обновить список релей-прокси."""
     try:
-        # Принудительно обновляем кеш прокси
-        from api.proxy_scraper import refresh_cache
-        refresh_cache(force=True)
         configs = get_proxy_configs(user_id)
         return jsonify({
             "success": True,
-            "message": f"🆕 Обновлено {len(configs)} прокси",
+            "message": f"🆕 {len(configs)} релей-прокси готовы",
             "servers": len(configs),
         })
     except Exception as e:
@@ -439,8 +452,6 @@ app_start_time = time.time()
 if __name__ == "__main__":
     # Инициализируем БД
     init_db()
-    # Инициализируем сборщик прокси
-    init_proxy_scraper()
 
     logger.info(f"╔══════════════════════════════════════════╗")
     logger.info(f"║  {BRAND} API Server v3.0")
@@ -450,7 +461,8 @@ if __name__ == "__main__":
     logger.info(f"╚══════════════════════════════════════════╝")
     logger.info(f"  Host: {HOST}:{PORT}")
     logger.info(f"  Render URL: {RENDER_URL or '(не задан)'}")
-    logger.info(f"  Прокси на пользователя: {SERVERS_CNT}")
+    logger.info(f"  Релей-прокси: {SERVERS_CNT} шт (HTTP CONNECT)")
+    logger.info(f"  Relay domain: {RELAY_DOMAIN}")
     logger.info(f"  Rate limit: {RATE_LIMIT} req/min")
     logger.info(f"  Data dir: {DATA_DIR}")
 
