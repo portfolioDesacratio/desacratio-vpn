@@ -156,15 +156,43 @@ def get_proxy_configs(user_id: str) -> list:
     """
     warp = _get_warp_config(user_id)
 
+    # Порты из WARP API + запасные
+    alt_ports = warp.get("peer_ports", [2408, 500, 1701, 4500])[:4]
+
     configs = []
     for srv in SERVERS:
+        base_ip = srv["endpoint"].rsplit(":", 1)[0]
+        main_port = int(srv["endpoint"].rsplit(":", 1)[1])
+        # Основной сервер (обычно port 2408)
         configs.append({
             "flag":       srv["flag"],
             "name":       srv["name"],
             "type":       "wireguard",
             "country":    srv["id"].upper(),
-            "server":     srv["endpoint"].rsplit(":", 1)[0],
-            "port":       int(srv["endpoint"].rsplit(":", 1)[1]),
+            "server":     base_ip,
+            "port":       main_port,
+            "local_address": [
+                f"{warp['v4']}/32",
+                f"{warp['v6']}/128",
+            ],
+            "private_key":      warp["private_key"],
+            "peer_public_key":  warp["peer_public_key"],
+            "reserved":         warp["reserved"],
+            "mtu": 1280,
+        })
+
+    # Добавляем запасные серверы с альтернативными портами (первый IP)
+    first_ip = SERVERS[0]["endpoint"].rsplit(":", 1)[0]
+    for port in alt_ports:
+        if port == 2408:
+            continue  # уже есть в основном списке
+        configs.append({
+            "flag":       "🔁",
+            "name":       f"Alt-{port}",
+            "type":       "wireguard",
+            "country":    "ALT",
+            "server":     first_ip,
+            "port":       port,
             "local_address": [
                 f"{warp['v4']}/32",
                 f"{warp['v6']}/128",
