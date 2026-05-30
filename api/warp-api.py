@@ -532,6 +532,22 @@ def refresh_subscription(user_id: str):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/sub/<user_id>/reset", methods=["POST"])
+@rate_limit
+def reset_subscription_keys(user_id: str):
+    """
+    Сбрасывает WARP ключи пользователя (работает и без подписки).
+    Используется ботом при истечении триала/подписки.
+    """
+    try:
+        if user_id in _warp_cache:
+            del _warp_cache[user_id]
+        logger.info(f"🔄 WARP keys reset for {user_id}")
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ─── CryptoBot Webhook ───────────────────────────────────────────────────
 
 @app.route("/cryptobot_webhook", methods=["POST"])

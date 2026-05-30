@@ -101,6 +101,28 @@ SERVERS = [
 
 # ─── Утилиты ─────────────────────────────────────────────────────────────
 
+def _plural_days(n: int) -> str:
+    """Склонение «день/дня/дней»."""
+    if 11 <= n % 100 <= 14:
+        return "дней"
+    if n % 10 == 1:
+        return "день"
+    if 2 <= n % 10 <= 4:
+        return "дня"
+    return "дней"
+
+
+def _maybe_reset_keys(user_id: int):
+    """Сбрасывает WARP ключи если у пользователя нет активной подписки."""
+    if has_active_sub(user_id):
+        return
+    try:
+        api_post(f"/api/sub/{user_id}/reset", timeout=10)
+        logger.info(f"🔄 Ключи сброшены для {user_id} (нет активной подписки)")
+    except Exception:
+        pass  # не критично
+
+
 def api_get(path: str, timeout: int = 10) -> dict:
     """GET запрос к API."""
     url = f"{API_BASE.rstrip('/')}/{path.lstrip('/')}"
@@ -291,6 +313,9 @@ async def my_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     user = query.from_user
 
+    # Чистим кеш Warp, если подписка истекла
+    _maybe_reset_keys(user_id)
+
     # Проверяем подписку
     sub_info = get_sub_info(user_id)
     has_sub = has_active_sub(user_id)
@@ -323,17 +348,30 @@ async def my_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🆔 ID: <code>{user_id}</code>\n\n"
             f"🎁 <b>Статус:</b> Пробный период\n"
             f"⏱ <b>Осталось:</b> {sub_info['days_left']} из {TRIAL_DAYS} дней\n\n"
+            f"━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━\n\n"
+            f"💡 <b>После триала — купи подписку</b>\n"
+            f"и все ключи останутся работать.\n\n"
             f"━━━━━━━━━━━━━━━━━━\n\n"
         )
     elif sub_info["status"] == "active":
+        # Форматируем остаток дней
+        plan_key = sub_info.get("type", "")
+        plan_label = PLANS.get(plan_key, {}).get("label", plan_key)
+
+        if sub_info.get("days_left") == -1:
+            days_text = "♾ Навсегда"
+        else:
+            dl = sub_info["days_left"]
+            days_text = f"⏱ <b>Осталось:</b> {dl} {_plural_days(dl)}\n"
+
         text += (
             f"📋 <b>Моя подписка — {BRAND}</b>\n\n"
             f"━━━━━━━━━━━━━━━━━━\n\n"
             f"👤 <b>Пользователь:</b> @{user.username or '—'}\n"
             f"🆔 ID: <code>{user_id}</code>\n\n"
             f"💎 <b>Статус:</b> Активна\n"
-            f"📦 <b>Тариф:</b> {PLANS.get(sub_info.get('type', ''), {}).get('label', sub_info.get('type', '—'))}\n"
-            f"⏱ <b>Осталось:</b> {sub_info['days_left']} дней\n\n"
+            f"📦 <b>Тариф:</b> {plan_label}\n"
+            f"{days_text}"
             f"━━━━━━━━━━━━━━━━━━\n\n"
         )
 
@@ -386,9 +424,12 @@ async def show_no_sub(update, context, sub_info):
     query = update.callback_query
     user_id = query.from_user.id
 
+    # Сбрасываем ключи пользователя (старые .conf станут недействительны)
+    _maybe_reset_keys(user_id)
+
     if sub_info["status"] == "expired_trial":
         title = "⏰ Пробный период закончился"
-        msg = "Твои 7 дней бесплатного доступа истекли.\nКупи подписку чтобы продолжить пользоваться."
+        msg = "Твои 7 дней бесплатного доступа истекли.\nКлючи сброшены — купи подписку чтобы продолжить."
     elif sub_info["status"] == "expired":
         title = "⏰ Подписка истекла"
         msg = "Срок действия подписки закончился.\nПродли её чтобы продолжить."
@@ -597,6 +638,19 @@ async def pay_stars_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_flexible=False,
         )
         logger.info(f"⭐️ Star invoice sent: user={user_id}, plan={plan_key}, stars={stars}")
+
+        # Отправляем подсказку
+        try:
+            await query.edit_message_text(
+                f"⭐️ <b>Счёт на оплату отправлен!</b>\n\n"
+                f"📦 <b>Тариф:</b> {plan['label']}\n"
+                f"💰 <b>Сумма:</b> {stars} ⭐\n\n"
+                f"💡 Найди сообщение со счётом выше и нажми «Оплатить».\n"
+                f"После оплаты подписка активируется автоматически ✅",
+                parse_mode="HTML"
+            )
+        except:
+            pass
     except Exception as e:
         logger.error(f"❌ Star invoice error: {e}")
         text = (
@@ -733,6 +787,7 @@ async def check_crypto_payment(update: Update, context: ContextTypes.DEFAULT_TYP
     if status == "paid":
         # Активируем подписку
         pending = get_pending_crypto(invoice_id)
+        plan_label = "Подписка"
         if pending:
             plan_key = pending["plan"]
             activate_subscription(user_id, plan_key)
@@ -744,9 +799,10 @@ async def check_crypto_payment(update: Update, context: ContextTypes.DEFAULT_TYP
             remove_pending_crypto(invoice_id)
 
         await query.message.reply_text(
-            f"✅ <b>Оплата подтверждена!</b>\n\n"
-            f"Подписка активирована 🎉\n"
-            f"Нажми «📋 Моя подписка» чтобы начать пользоваться.",
+            f"✅ <b>Успешно! Подписка выдана</b>\n\n"
+            f"💎 <b>Оплата:</b> CryptoBot ({CRYPTOBOT_ASSET})\n"
+            f"📦 <b>Тариф:</b> {plan_label}\n\n"
+            f"👇 Нажми чтобы начать пользоваться:",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📋 Моя подписка", callback_data="my_sub")
@@ -836,9 +892,9 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if success:
         text = (
-            f"⭐️ <b>Оплата получена!</b>\n\n"
+            f"✅ <b>Успешно! Подписка выдана</b>\n\n"
+            f"⭐️ <b>Оплата:</b> Telegram Stars\n"
             f"📦 <b>Тариф:</b> {plan_label}\n"
-            f"💳 <b>Способ:</b> Telegram Stars\n"
             f"💰 <b>Списано:</b> {payment.total_amount} ⭐\n\n"
             f"👇 Нажми чтобы начать пользоваться:"
         )
@@ -1204,6 +1260,8 @@ async def admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
+        # Сбрасываем старые ключи перед активацией
+        _maybe_reset_keys(target_id)
         activate_sub(target_id, plan, user_id)
         plan_label = PLANS[plan]["label"]
         await update.message.reply_text(

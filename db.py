@@ -160,6 +160,7 @@ def has_active_sub(user_id: int) -> bool:
 def get_sub_info(user_id: int) -> dict:
     """
     Возвращает информацию о подписке пользователя.
+    Приоритет: платная > пробный > истекшие.
     """
     user = get_user(user_id)
     if not user:
@@ -167,7 +168,26 @@ def get_sub_info(user_id: int) -> dict:
 
     now = int(time.time())
 
-    # Пробный период
+    # ⭐ Платная подписка — высший приоритет
+    if user["sub_end"] and now < user["sub_end"]:
+        if user["sub_type"] == "forever":
+            return {
+                "status": "active",
+                "days_left": -1,       # -1 = навсегда
+                "type": "forever",
+                "sub_start": user["sub_start"],
+                "sub_end": user["sub_end"],
+            }
+        days_left = max(0, (user["sub_end"] - now) // 86400)
+        return {
+            "status": "active",
+            "days_left": int(days_left),
+            "type": user["sub_type"],
+            "sub_start": user["sub_start"],
+            "sub_end": user["sub_end"],
+        }
+
+    # 🎁 Пробный период (только если нет активной платной)
     if user["trial_start"] and user["trial_used"]:
         elapsed = now - user["trial_start"]
         days_left = max(0, TRIAL_DAYS - elapsed // 86400)
@@ -179,22 +199,11 @@ def get_sub_info(user_id: int) -> dict:
                 "trial_used": True,
             }
 
-    # Платная подписка
-    if user["sub_end"] and now < user["sub_end"]:
-        days_left = max(0, (user["sub_end"] - now) // 86400)
-        return {
-            "status": "active",
-            "days_left": int(days_left),
-            "type": user["sub_type"],
-            "sub_start": user["sub_start"],
-            "sub_end": user["sub_end"],
-        }
-
-    # Пробный период истёк
+    # ⏰ Пробный период истёк (и нет платной подписки)
     if user["trial_used"] and not user["sub_end"]:
         return {"status": "expired_trial", "days_left": 0}
 
-    # Платная подписка истекла
+    # ⏰ Платная подписка истекла
     if user["sub_end"] and now >= user["sub_end"]:
         return {"status": "expired", "days_left": 0}
 
