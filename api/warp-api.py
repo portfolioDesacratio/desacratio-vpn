@@ -439,17 +439,24 @@ def get_subscription(user_id: str):
     """
     Sing-box подписка (WireGuard WARP, JSON).
 
-    Поддерживаемые форматы (?format=):
-      - full  (по умолчанию) — inbounds + outbounds (без DNS/route/log)
-      - array                — JSON-массив outbound'ов (для совместимости)
+    По умолчанию возвращается JSON-массив WireGuard outbound'ов —
+    это универсальный формат, который понимают все клиенты на Sing-box.
+
+    Параметры (?format=):
+      - array (по умолчанию) — JSON-массив outbound'ов
+      - full                 — полный конфиг с inbounds + outbounds
     """
     try:
         configs = get_proxy_configs(user_id)
         sub = format_singbox(configs, user_id)
 
-        # Если запрошен формат array — отдаём только WireGuard outbound'ы
-        fmt = request.args.get("format", "full")
-        if fmt == "array":
+        # По умолчанию отдаём голый массив outbound'ов
+        fmt = request.args.get("format", "array")
+        if fmt == "full":
+            # Полный конфиг с inbounds (для клиентов, которые это поддерживают)
+            pass  # sub уже полный конфиг от format_singbox()
+        else:
+            # Массив только WireGuard outbound'ов
             sub = [o for o in sub["outbounds"] if o["type"] == "wireguard"]
 
         resp = app.response_class(
