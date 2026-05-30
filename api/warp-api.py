@@ -343,6 +343,40 @@ def format_wg_conf_all(proxy_configs: list, user_id: str) -> str:
     return "\n".join(parts)
 
 
+# ─── Render Proxy Config (для России, где WARP UDP порты заблокированы) ────
+
+def format_render_proxy(user_id: str) -> list:
+    """
+    HTTP CONNECT прокси через Relay на Render (США, порт 443 всегда открыт).
+    
+    Используется когда WARP WireGuard UDP порты (2408/500/1701/4500)
+    заблокированы провайдером (РФ). Трафик идёт:
+      User → Render (TCP 443, CONNECT) → Destination
+      
+    Render видит US IP, поэтому блокировки обходятся.
+    
+    Формат: JSON-массив с одним HTTP outbound (для Happ/Hiddify/Sing-box).
+    """
+    # Берём URL Render из переменной окружения
+    raw_url = RENDER_URL or "https://desacratio-vpn.onrender.com"
+    proxy_host = raw_url.replace("https://", "").replace("http://", "").rstrip("/")
+    # Убираем порт из URL если есть (используем стандартный 443)
+    if ":" in proxy_host:
+        proxy_host = proxy_host.split(":")[0]
+
+    config = [{
+        "type": "http",
+        "tag": "Render-US (прокси)",
+        "server": proxy_host,
+        "server_port": 443,
+        "tls": {
+            "enabled": True
+        }
+    }]
+
+    return config
+
+
 # ─── Subscription Check ──────────────────────────────────────────────────
 
 def require_subscription(f):
@@ -472,25 +506,38 @@ def get_sub_status(user_id: str):
 @require_subscription
 def get_subscription(user_id: str):
     """
-    Sing-box подписка (WireGuard WARP, JSON).
+    Sing-box подписка (WireGuard WARP + Render Proxy, JSON).
 
-    По умолчанию — JSON-массив WireGuard outbound'ов (для Happ/Hiddify).
-    Полный конфиг с inbounds — через ?format=full (может не работать в Happ).
-
-    Параметры (?format=):
+    По умолчанию — WARP WireGuard outbound'ы (5 стран + альт. порты).
+    
+    Режимы (?mode=):
+      - warp (по умолчанию)  — WARP WireGuard outbound'ы
+      - render               — HTTP CONNECT прокси через Render (обход блокировок РФ)
+    
+    Параметры для mode=warp (?format=):
       - array (по умолчанию) — JSON-массив outbound'ов
       - full                 — полный конфиг с inbounds + outbounds + route
     """
     try:
-        configs = get_proxy_configs(user_id)
-        sub = format_singbox(configs, user_id)
+        mode = request.args.get("mode", "warp")
 
-        # По умолчанию отдаём массив outbound'ов (Happ так понимает)
-        fmt = request.args.get("format", "array")
-        if fmt == "full":
-            pass  # sub уже полный конфиг от format_singbox()
+        if mode == "render":
+            sub = format_render_proxy(user_id)
+            profile_title = f"{BRAND} (Render прокси)"
+            logger.info(f"📤 Render-Proxy для {user_id}: 1 сервер (HTTP CONNECT)")
         else:
-            sub = [o for o in sub["outbounds"] if o["type"] == "wireguard"]
+            configs = get_proxy_configs(user_id)
+            sub = format_singbox(configs, user_id)
+
+            # По умолчанию отдаём массив outbound'ов (Happ так понимает)
+            fmt = request.args.get("format", "array")
+            if fmt == "full":
+                pass  # sub уже полный конфиг от format_singbox()
+            else:
+                sub = [o for o in sub["outbounds"] if o["type"] == "wireguard"]
+
+            profile_title = BRAND
+            logger.info(f"📤 Sing-box WARP для {user_id}: {len(configs)} серверов (format={fmt})")
 
         resp = app.response_class(
             response=json.dumps(sub, indent=2, ensure_ascii=False),
@@ -498,12 +545,11 @@ def get_subscription(user_id: str):
             mimetype="application/json",
         )
         resp.headers["Subscription-Userinfo"] = "upload=0; download=0; total=1099511627776; expire=0"
-        resp.headers["Profile-Title"] = BRAND
+        resp.headers["Profile-Title"] = profile_title
         resp.headers["Profile-Update-Interval"] = "24"
         resp.headers["Content-Disposition"] = "attachment; filename=\"desacratio-singbox.json\""
         resp.headers["Access-Control-Allow-Origin"] = "*"
 
-        logger.info(f"📤 Sing-box WARP для {user_id}: {len(configs)} серверов (format={fmt})")
         return resp
     except Exception as e:
         logger.error(f"Subscription error for {user_id}: {e}")
