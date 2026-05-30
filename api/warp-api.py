@@ -182,10 +182,11 @@ def get_proxy_configs(user_id: str) -> list:
 
 def format_singbox(proxy_configs: list, user_id: str) -> dict | list:
     """
-    Minimal Sing-box config — inbounds + outbounds, no DNS/route/log.
-
-    Inbounds слушает на 0.0.0.0:2080 (mixed: SOCKS5 + HTTP).
-    Если запрошен формат 'array' — возвращается JSON-массив outbound'ов.
+    Полный Sing-box конфиг с inbounds, outbounds и route.
+    
+    - inbound: mixed на 0.0.0.0:2080 (SOCKS5 + HTTP, без listen_port — port)
+    - route.final: первый WG сервер (весь трафик через WARP)
+    - Нет DNS/log — не ломаем совместимость
     """
     wireguard_outbounds = []
     for cfg in proxy_configs:
@@ -201,6 +202,8 @@ def format_singbox(proxy_configs: list, user_id: str) -> dict | list:
             "mtu": cfg.get("mtu", 1280),
         })
 
+    first_server_tag = wireguard_outbounds[0]["tag"] if wireguard_outbounds else "direct"
+
     outbounds = wireguard_outbounds + [
         {"type": "direct", "tag": "direct"},
     ]
@@ -209,12 +212,16 @@ def format_singbox(proxy_configs: list, user_id: str) -> dict | list:
         "inbounds": [
             {
                 "type": "mixed",
-                "tag": "mixed-in",
+                "tag": "in",
                 "listen": "0.0.0.0",
-                "listen_port": 2080,
+                "port": 2080,
             }
         ],
         "outbounds": outbounds,
+        "route": {
+            "auto_detect_interface": True,
+            "final": first_server_tag,
+        },
     }
 
 
@@ -439,24 +446,20 @@ def get_subscription(user_id: str):
     """
     Sing-box подписка (WireGuard WARP, JSON).
 
-    По умолчанию возвращается JSON-массив WireGuard outbound'ов —
-    это универсальный формат, который понимают все клиенты на Sing-box.
+    По умолчанию — полный конфиг с inbound (mixed), outbounds (5 WG + direct)
+    и route.final = первый сервер (весь трафик через WARP).
 
     Параметры (?format=):
-      - array (по умолчанию) — JSON-массив outbound'ов
-      - full                 — полный конфиг с inbounds + outbounds
+      - full (по умолчанию) — полный конфиг с inbounds + outbounds + route
+      - array               — JSON-массив outbound'ов (для старых клиентов)
     """
     try:
         configs = get_proxy_configs(user_id)
         sub = format_singbox(configs, user_id)
 
-        # По умолчанию отдаём голый массив outbound'ов
-        fmt = request.args.get("format", "array")
-        if fmt == "full":
-            # Полный конфиг с inbounds (для клиентов, которые это поддерживают)
-            pass  # sub уже полный конфиг от format_singbox()
-        else:
-            # Массив только WireGuard outbound'ов
+        # Если запрошен формат array — отдаём только WireGuard outbound'ы
+        fmt = request.args.get("format", "full")
+        if fmt == "array":
             sub = [o for o in sub["outbounds"] if o["type"] == "wireguard"]
 
         resp = app.response_class(
