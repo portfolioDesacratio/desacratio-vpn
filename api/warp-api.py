@@ -180,10 +180,12 @@ def get_proxy_configs(user_id: str) -> list:
 
 # ─── Форматтеры подписок (WARP / WireGuard) ────────────────────────────────
 
-def format_singbox(proxy_configs: list, user_id: str) -> dict:
+def format_singbox(proxy_configs: list, user_id: str) -> dict | list:
     """
-    Полный Sing-box конфиг, который можно загрузить напрямую.
-    Включает inbounds, outbounds, route, dns.
+    Минимальный Sing-box конфиг — только inbounds + outbounds.
+    Никаких DNS/route/log — чтобы не ломать клиентов с разными версиями ядра.
+
+    Если запрошен формат 'array' — возвращается список outbound'ов.
     """
     wireguard_outbounds = []
     for cfg in proxy_configs:
@@ -201,46 +203,17 @@ def format_singbox(proxy_configs: list, user_id: str) -> dict:
 
     outbounds = wireguard_outbounds + [
         {"type": "direct", "tag": "direct"},
-        {"type": "block",  "tag": "block"},
-        {"type": "dns",    "tag": "dns-out"},
     ]
 
-    proxy_tags = [o["tag"] for o in wireguard_outbounds]
-
     return {
-        "log": {
-            "level": "warn",
-            "timestamp": True,
-        },
-        "dns": {
-            "servers": [
-                {"tag": "local", "address": "https://1.1.1.1/dns-query",
-                 "detour": "direct"},
-                {"tag": "block", "address": "rcode://refused"},
-            ],
-            "strategy": "prefer_ipv4",
-        },
         "inbounds": [
             {
                 "type": "mixed",
                 "tag": "mixed-in",
-                "listen": "0.0.0.0",
-                "listen_port": 2080,
-                "sniff": True,
-                "sniff_override_destination": False,
+                "listen": "127.0.0.1:2080",
             }
         ],
         "outbounds": outbounds,
-        "route": {
-            "rules": [
-                {"protocol": "dns", "outbound": "dns-out"},
-                {"geosite": "category-ads-all", "outbound": "block"},
-                {"geoip": ["cn", "private"], "outbound": "direct"},
-                {"geosite": "cn", "outbound": "direct"},
-            ],
-            "auto_detect_interface": True,
-            "final": proxy_tags[0] if proxy_tags else "direct",
-        },
     }
 
 
@@ -473,10 +446,10 @@ def get_subscription(user_id: str):
         configs = get_proxy_configs(user_id)
         sub = format_singbox(configs, user_id)
 
-        # Если запрошен формат array — отдаём только outbound'ы
+        # Если запрошен формат array — отдаём только WireGuard outbound'ы
         fmt = request.args.get("format", "full")
         if fmt == "array":
-            sub = sub["outbounds"]
+            sub = [o for o in sub["outbounds"] if o["type"] == "wireguard"]
 
         resp = app.response_class(
             response=json.dumps(sub, indent=2, ensure_ascii=False),
