@@ -182,11 +182,9 @@ def get_proxy_configs(user_id: str) -> list:
 
 def format_singbox(proxy_configs: list, user_id: str) -> dict | list:
     """
-    Минимальный Sing-box конфиг — только outbounds (без inbounds/DNS/route/log).
+    Minimal Sing-box config — inbounds + outbounds, no DNS/route/log.
 
-    Клиент сам добавляет свой inbound, так мы избегаем проблем совместимости
-    с разными версиями ядра Sing-box.
-
+    Inbounds слушает на 0.0.0.0:2080 (mixed: SOCKS5 + HTTP).
     Если запрошен формат 'array' — возвращается JSON-массив outbound'ов.
     """
     wireguard_outbounds = []
@@ -207,7 +205,17 @@ def format_singbox(proxy_configs: list, user_id: str) -> dict | list:
         {"type": "direct", "tag": "direct"},
     ]
 
-    return {"outbounds": outbounds}
+    return {
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "0.0.0.0",
+                "listen_port": 2080,
+            }
+        ],
+        "outbounds": outbounds,
+    }
 
 
 def format_clash(proxy_configs: list, user_id: str) -> str:
@@ -432,7 +440,7 @@ def get_subscription(user_id: str):
     Sing-box подписка (WireGuard WARP, JSON).
 
     Поддерживаемые форматы (?format=):
-      - full  (по умолчанию) — JSON-объект с outbounds (без inbounds)
+      - full  (по умолчанию) — inbounds + outbounds (без DNS/route/log)
       - array                — JSON-массив outbound'ов (для совместимости)
     """
     try:
