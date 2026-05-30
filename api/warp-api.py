@@ -181,10 +181,13 @@ def get_proxy_configs(user_id: str) -> list:
 # ─── Форматтеры подписок (WARP / WireGuard) ────────────────────────────────
 
 def format_singbox(proxy_configs: list, user_id: str) -> dict:
-    """Формат Sing-box JSON с WireGuard outbound'ами."""
-    outbounds = []
+    """
+    Полный Sing-box конфиг, который можно загрузить напрямую.
+    Включает inbounds, outbounds, route, dns.
+    """
+    wireguard_outbounds = []
     for cfg in proxy_configs:
-        outbounds.append({
+        wireguard_outbounds.append({
             "type": "wireguard",
             "tag": f"{cfg['flag']} {cfg['name']}",
             "server": cfg["server"],
@@ -196,14 +199,57 @@ def format_singbox(proxy_configs: list, user_id: str) -> dict:
             "mtu": cfg.get("mtu", 1280),
         })
 
-    return {"outbounds": outbounds}
+    outbounds = wireguard_outbounds + [
+        {"type": "direct", "tag": "direct"},
+        {"type": "block",  "tag": "block"},
+        {"type": "dns",    "tag": "dns-out"},
+    ]
+
+    proxy_tags = [o["tag"] for o in wireguard_outbounds]
+
+    return {
+        "log": {
+            "level": "warn",
+            "timestamp": True,
+        },
+        "dns": {
+            "servers": [
+                {"tag": "local", "address": "https://1.1.1.1/dns-query",
+                 "detour": "direct"},
+                {"tag": "block", "address": "rcode://refused"},
+            ],
+            "strategy": "prefer_ipv4",
+        },
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "0.0.0.0",
+                "listen_port": 2080,
+                "sniff": True,
+                "sniff_override_destination": False,
+            }
+        ],
+        "outbounds": outbounds,
+        "route": {
+            "rules": [
+                {"protocol": "dns", "outbound": "dns-out"},
+                {"geosite": "category-ads-all", "outbound": "block"},
+                {"geoip": ["cn", "private"], "outbound": "direct"},
+                {"geosite": "cn", "outbound": "direct"},
+            ],
+            "auto_detect_interface": True,
+            "final": proxy_tags[0] if proxy_tags else "direct",
+        },
+    }
 
 
 def format_clash(proxy_configs: list, user_id: str) -> str:
-    """Формат Clash Meta YAML с WireGuard прокси."""
+    """
+    Clash Meta YAML — минимальный совместимый конфиг с WireGuard прокси.
+    Без port/socks-port чтобы не конфликтовать с настройками клиента.
+    """
     lines = [
-        "port: 7890",
-        "socks-port: 7891",
         "allow-lan: false",
         "mode: Rule",
         "log-level: warning",
@@ -416,15 +462,26 @@ def get_sub_status(user_id: str):
 @rate_limit
 @require_subscription
 def get_subscription(user_id: str):
-    """Sing-box подписка (WireGuard WARP, JSON)."""
+    """
+    Sing-box подписка (WireGuard WARP, JSON).
+
+    Поддерживаемые форматы (?format=):
+      - full  (по умолчанию) — полный Sing-box конфиг с inbounds/route/dns
+      - array                — JSON-массив outbound'ов (для совместимости)
+    """
     try:
         configs = get_proxy_configs(user_id)
         sub = format_singbox(configs, user_id)
 
+        # Если запрошен формат array — отдаём только outbound'ы
+        fmt = request.args.get("format", "full")
+        if fmt == "array":
+            sub = sub["outbounds"]
+
         resp = app.response_class(
             response=json.dumps(sub, indent=2, ensure_ascii=False),
             status=200,
-            mimetype="text/plain",
+            mimetype="application/json",
         )
         resp.headers["Subscription-Userinfo"] = "upload=0; download=0; total=1099511627776; expire=0"
         resp.headers["Profile-Title"] = BRAND
@@ -432,7 +489,7 @@ def get_subscription(user_id: str):
         resp.headers["Content-Disposition"] = "attachment; filename=\"desacratio-singbox.json\""
         resp.headers["Access-Control-Allow-Origin"] = "*"
 
-        logger.info(f"📤 Sing-box WARP для {user_id}: {len(configs)} серверов")
+        logger.info(f"📤 Sing-box WARP для {user_id}: {len(configs)} серверов (format={fmt})")
         return resp
     except Exception as e:
         logger.error(f"Subscription error for {user_id}: {e}")
@@ -451,7 +508,7 @@ def get_clash_subscription(user_id: str):
         resp = app.response_class(
             response=yaml_str,
             status=200,
-            mimetype="text/plain",
+            mimetype="text/yaml; charset=utf-8",
         )
         resp.headers["Subscription-Userinfo"] = "upload=0; download=0; total=1099511627776; expire=0"
         resp.headers["Profile-Title"] = BRAND
