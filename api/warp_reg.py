@@ -176,10 +176,24 @@ def register_warp(device_id: str | None = None) -> dict:
 
     # 4. Парсим ответ
     response_id = data.get("id", device_id)
-    server_public_key = data.get("key", "")
     token = data.get("token", "")
     account = data.get("account", {})
     config_data = data.get("config", {})
+
+    # Серверный публичный ключ — в config.peers[0].public_key, НЕ в data.key!
+    # (data.key — это НАШ собственный ключ, переданный в запросе)
+    peers = config_data.get("peers", [])
+    if peers:
+        server_public_key = peers[0].get("public_key", "")
+        peer_endpoint = peers[0].get("endpoint", {})
+        # endpoint host (engage.cloudflareclient.com:2408) или v4
+        endpoint_host = peer_endpoint.get("host", f"{peer_endpoint.get('v4', 'engage.cloudflareclient.com')}:2408")
+        # доступные порты
+        peer_ports = peer_endpoint.get("ports", [2408, 500, 1701, 4500])
+    else:
+        server_public_key = data.get("key", "")
+        endpoint_host = WARP_ENDPOINT
+        peer_ports = [2408]
 
     # Извлекаем адреса
     interface_data = config_data.get("interface", {})
@@ -187,10 +201,21 @@ def register_warp(device_id: str | None = None) -> dict:
     v4 = addresses.get("v4", "172.16.0.2")
     v6 = addresses.get("v6", "2606:4700:110:8a20::1")
 
-    # Client ID = первые 4 байта UUID (как в warp-reg Go)
-    client_id = response_id.replace("-", "")[:8]
-    reserved_bytes = bytes.fromhex(client_id)[:3]
-    reserved = list(reserved_bytes)
+    # Client ID — из config.client_id (base64, 3 байта), НЕ из UUID!
+    # Старые API возвращали client_id как hex-префикс UUID,
+    # новые — как base64-строку из 3 байт.
+    raw_client_id = config_data.get("client_id", "")
+    if raw_client_id:
+        try:
+            reserved_bytes = base64.b64decode(raw_client_id + "==")  # pad
+            reserved = list(reserved_bytes[:3])
+        except Exception:
+            reserved = [0, 0, 0]
+    else:
+        # Fallback: первые 4 байта UUID (старый метод)
+        client_hex = response_id.replace("-", "")[:8]
+        reserved_bytes = bytes.fromhex(client_hex)[:3]
+        reserved = list(reserved_bytes)
 
     return {
         "device_id": response_id,
@@ -200,11 +225,12 @@ def register_warp(device_id: str | None = None) -> dict:
         "license": account.get("license", ""),
         "private_key": private_b64,
         "peer_public_key": server_public_key,
-        "client_id": client_id,
+        "client_id": raw_client_id,
         "reserved": reserved,
         "v4": v4,
         "v6": v6,
-        "endpoint": WARP_ENDPOINT,
+        "endpoint": endpoint_host,
+        "peer_ports": peer_ports,
     }
 
 
