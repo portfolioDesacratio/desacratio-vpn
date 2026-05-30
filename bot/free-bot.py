@@ -1377,10 +1377,10 @@ async def admin_test_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка getBalance: {e}")
 
-    # Тест createInvoice (0.01 USDT)
+    # Тест createInvoice (1 USDT — минимум $0.01, но 1 для верности)
     try:
         invoice = api.create_invoice(
-            amount="0.01",
+            amount="1",
             payload="test_invoice",
             description="Test invoice — delete me",
             expires_in=60,  # 1 минута

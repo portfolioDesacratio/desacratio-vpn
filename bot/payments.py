@@ -99,7 +99,7 @@ class CryptoBotAPI:
     # ── API Methods ──────────────────────────────────────────────────────
 
     def _request(self, method: str, data: dict = None) -> dict:
-        """Базовый POST-запрос к CryptoBot API."""
+        """Базовый запрос к CryptoBot API (поддерживает GET и POST)."""
         if not self.token:
             return {"ok": False, "error": "CryptoBot token not configured"}
 
@@ -107,11 +107,14 @@ class CryptoBotAPI:
         headers = {
             "Crypto-Pay-API-Token": self.token,
             "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         }
         body = json.dumps(data).encode() if data else None
+        # GET если нет тела, иначе POST
+        http_method = "GET" if not data else "POST"
 
         try:
-            req = Request(url, data=body, headers=headers, method="POST")
+            req = Request(url, data=body, headers=headers, method=http_method)
             with urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode())
         except HTTPError as e:
