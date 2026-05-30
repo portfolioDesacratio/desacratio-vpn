@@ -187,7 +187,7 @@ def get_proxy_configs(user_id: str) -> list:
         if port == 2408:
             continue  # уже есть в основном списке
         configs.append({
-            "flag":       "🔁",
+            "flag":       "",
             "name":       f"Alt-{port}",
             "type":       "wireguard",
             "country":    "ALT",
@@ -474,20 +474,22 @@ def get_subscription(user_id: str):
     """
     Sing-box подписка (WireGuard WARP, JSON).
 
-    По умолчанию — полный конфиг с inbound (mixed), outbounds (5 WG + direct)
-    и route.final = первый сервер (весь трафик через WARP).
+    По умолчанию — JSON-массив WireGuard outbound'ов (для Happ/Hiddify).
+    Полный конфиг с inbounds — через ?format=full (может не работать в Happ).
 
     Параметры (?format=):
-      - full (по умолчанию) — полный конфиг с inbounds + outbounds + route
-      - array               — JSON-массив outbound'ов (для старых клиентов)
+      - array (по умолчанию) — JSON-массив outbound'ов
+      - full                 — полный конфиг с inbounds + outbounds + route
     """
     try:
         configs = get_proxy_configs(user_id)
         sub = format_singbox(configs, user_id)
 
-        # Если запрошен формат array — отдаём только WireGuard outbound'ы
-        fmt = request.args.get("format", "full")
-        if fmt == "array":
+        # По умолчанию отдаём массив outbound'ов (Happ так понимает)
+        fmt = request.args.get("format", "array")
+        if fmt == "full":
+            pass  # sub уже полный конфиг от format_singbox()
+        else:
             sub = [o for o in sub["outbounds"] if o["type"] == "wireguard"]
 
         resp = app.response_class(
